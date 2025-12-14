@@ -742,14 +742,25 @@ def semantic_scores_for_retrieved(
     embedding_manager: EmbeddingManager,
     use_bertscore: bool
 ):
-    method = "bert_score"
+    """
+    Compute semantic similarity scores for a list of retrieved texts against a gold answer.
+    Uses BERTScore when available and requested (now using raw scores, not rescaled baseline),
+    otherwise falls back to embedding cosine similarity.
+
+    Returns:
+      (scores_list, method_name, elapsed_seconds)
+    """
+    method = "bert_score_raw"
     start = time.time()
     scores = []
     if use_bertscore and BERTSCORE_AVAILABLE and len(retrieved_texts) > 0:
         try:
             refs = [gold] * len(retrieved_texts)
-            P, R, F = bert_score_fn(retrieved_texts, refs, lang="en", rescale_with_baseline=True)
-            scores = [float(x) for x in F]
+            # NOTE: use rescale_with_baseline=False so output stays in the familiar [0,1] range.
+            # The previous code used rescale_with_baseline=True which can produce negative/rescaled values.
+            P, R, F = bert_score_fn(retrieved_texts, refs, lang="en", rescale_with_baseline=False)
+            # Clamp values to [0,1] for safe downstream aggregation/plots
+            scores = [max(0.0, min(1.0, float(x))) for x in F]
             elapsed = time.time() - start
             return scores, method, elapsed
         except Exception:
@@ -770,7 +781,6 @@ def semantic_scores_for_retrieved(
         scores = [0.0] * len(retrieved_texts)
     elapsed = time.time() - start
     return scores, method, elapsed
-
 def compute_mean_support_score(results: List[Dict[str, Any]]) -> float:
     """
     Compute a stable mean support score in [0,1].
