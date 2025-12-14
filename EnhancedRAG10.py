@@ -14,6 +14,7 @@ pip install sentence-transformers==5.1.2
 pip install transformers==4.57.1
 pip install pymupdf
 pip install pypdf
+pip install rank-bm25
 pip install matplotlib"""
 import os
 import re
