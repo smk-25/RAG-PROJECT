@@ -1,0 +1,8 @@
+chromadb
+streamlit
+langchain
+sentence-transformers==5.1.2
+transformers==4.57.1
+pymupdf
+pypdf
+matplotlib
