@@ -6,3 +6,6 @@ transformers==4.57.1
 pymupdf
 pypdf
 matplotlib
+langchain-community
+langchain-core
+langchain-groq
