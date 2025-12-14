@@ -6,3 +6,4 @@ transformers==4.57.1
 pymupdf
 pypdf
 matplotlib
+google-adk
