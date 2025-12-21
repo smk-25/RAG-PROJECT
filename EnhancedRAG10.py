@@ -1,4 +1,4 @@
-# ENHANCEDRAG10 (Dense + Sparse Prefilter + Eval Comparison).py
+# ENHANCEDRAG10.TEST1 (Dense + Sparse Prefilter + Eval Comparison).py
 
 # Combined RAG app + evaluation additions (Recall@K, Precision@K, EM, F1, ROUGE-1, ROUGE-L, BERTScore fallback)
 # + UI controls: top_m_for_cross, answer display mode, retrieval times saved in eval.
