@@ -1,3 +1,21 @@
+# ENHANCEDRAG10.TEST1 (Dense + Sparse Prefilter + Eval Comparison).py
+
+# Combined RAG app + evaluation additions (Recall@K, Precision@K, EM, F1, ROUGE-1, ROUGE-L, BERTScore fallback)
+# + UI controls: top_m_for_cross, answer display mode, retrieval times saved in eval.
+# + Sparse-first retrieval with BM25 prefilter -> dense -> cross-encoder.
+# + NEW: Evaluation toggle to compare dense-only vs sparse+dense retrieval.
+"""
+pip install chromadb
+pip install streamlit
+pip install -U langchain-groq==0.3.8
+pip install -U langchain-community==0.3.31
+pip install langchain-core==0.3.79
+pip install sentence-transformers==5.1.2
+pip install transformers==4.57.1
+pip install pymupdf
+pip install pypdf
+pip install rank-bm25
+pip install matplotlib"""
 import os
 import re
 import hashlib
