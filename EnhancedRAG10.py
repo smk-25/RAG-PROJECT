@@ -1472,6 +1472,7 @@ if uploaded_files and len(uploaded_files) > 0:
                     plot_hist(res_df["precision_at_1"], "Precision@1 distribution")
                 if run_llm:
                     plot_hist(res_df["f1"].dropna(), "LLM F1 distribution")
+                    plot_hist(res_df["token_precision"].dropna(), "Token Precision distribution")
                     plot_hist(res_df["rouge_1"].dropna(), "ROUGE-1 distribution")
                     plot_hist(res_df["rouge_l"].dropna(), "ROUGE-L distribution")
 
