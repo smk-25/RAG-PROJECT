@@ -219,13 +219,56 @@ def rouge_l(pred: str, gold: str) -> float:
 # ---------- Provenance stripping ----------
 _PROV_SPLIT_RE = re.compile(r"\n\s*(\[\d+\]\s*Source:|→\s*Source:|Source:|Source\s*[:\-])", flags=re.IGNORECASE)
 def strip_provenance(text: str) -> str:
+    """
+    Remove source citations, page numbers, chunk references, and clause content from generated text.
+    """
     if not text:
         return ""
+    
+    # Split at source markers and take only the first part (the actual answer)
     parts = _PROV_SPLIT_RE.split(text)
     cleaned = parts[0] if parts else text
+    
+    # Remove chunk references like (chunk:hash) or (chunk hash)
     cleaned = re.sub(r"\(chunk:?[^\)]*\)", "", cleaned, flags=re.IGNORECASE)
+    
+    # Remove bracketed or parenthesized numbers like [1], (2), [3]
     cleaned = re.sub(r"[\[\(]\s*\d+\s*[\]\)]", "", cleaned)
-    cleaned = re.sub(r"\n{2,}", "\n\n", cleaned).strip()
+    
+    # Remove source file references like "Source: filename.pdf" or "source file.pdf"
+    # Match only valid filename characters (alphanumeric, hyphens, underscores, dots)
+    cleaned = re.sub(r"source\s*:?\s*[\w\.\-]+\.pdf", "", cleaned, flags=re.IGNORECASE)
+    
+    # Remove page number references like "Page 5", "page 5", "on page 5"
+    cleaned = re.sub(r"\b(?:on\s+)?pages?\s+\d+(?:\s*-\s*\d+)?", "", cleaned, flags=re.IGNORECASE)
+    
+    # Remove clause references like "Clause 1.2.3" or "clause 1.2"
+    cleaned = re.sub(r"\bclause\s+\d+(?:\.\d+)*", "", cleaned, flags=re.IGNORECASE)
+    
+    # Remove section references like "Section 1.2.3" or "section 1.2"
+    cleaned = re.sub(r"\bsection\s+\d+(?:\.\d+)*", "", cleaned, flags=re.IGNORECASE)
+    
+    # Remove references to chunks like "in chunk" or "from chunk"
+    cleaned = re.sub(r"(?:in|from)\s+chunk(?:\s+\w+)?", "", cleaned, flags=re.IGNORECASE)
+    
+    # Remove references like "According to [source]", "Based on source", "As per document"
+    # with optional punctuation after (comma or colon)
+    cleaned = re.sub(r"(?:according\s+to|based\s+on|as\s+per)\s+(?:the\s+)?(?:source|document)s?\s*[,:]?", "", cleaned, flags=re.IGNORECASE)
+    
+    # Clean up dangling punctuation at line/sentence boundaries
+    # This removes commas or colons that appear after string start, periods, or newlines
+    cleaned = re.sub(r"(^|\.|\n)\s*[,:]", r"\1", cleaned)
+    
+    # Clean up multiple spaces
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    
+    # Clean up multiple newlines
+    cleaned = re.sub(r"\n{2,}", "\n\n", cleaned)
+    
+    # Remove leading/trailing whitespace and clean up comma/period spacing
+    cleaned = cleaned.strip()
+    cleaned = re.sub(r"\s+([,\.])", r"\1", cleaned)
+    
     return cleaned
 
 # ------------------------
