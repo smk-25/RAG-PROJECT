@@ -236,7 +236,8 @@ def strip_provenance(text: str) -> str:
     cleaned = re.sub(r"[\[\(]\s*\d+\s*[\]\)]", "", cleaned)
     
     # Remove source file references like "Source: filename.pdf" or "source file.pdf"
-    cleaned = re.sub(r"source\s*:?\s*[^\s,\.]+\.pdf", "", cleaned, flags=re.IGNORECASE)
+    # Match only valid filename characters (alphanumeric, hyphens, underscores, dots)
+    cleaned = re.sub(r"source\s*:?\s*[\w\-\.]+\.pdf", "", cleaned, flags=re.IGNORECASE)
     
     # Remove page number references like "Page 5", "page 5", "on page 5"
     cleaned = re.sub(r"\b(?:on\s+)?pages?\s+\d+(?:\s*-\s*\d+)?", "", cleaned, flags=re.IGNORECASE)
@@ -250,10 +251,12 @@ def strip_provenance(text: str) -> str:
     # Remove references to chunks like "in chunk" or "from chunk"
     cleaned = re.sub(r"(?:in|from)\s+chunk(?:\s+\w+)?", "", cleaned, flags=re.IGNORECASE)
     
-    # Remove references like "According to [source]" or "Based on source" (with optional punctuation after)
+    # Remove references like "According to [source]", "Based on source", "As per document"
+    # with optional punctuation after (comma or colon)
     cleaned = re.sub(r"(?:according\s+to|based\s+on|as\s+per)\s+(?:the\s+)?(?:source|document)s?\s*[,:]?", "", cleaned, flags=re.IGNORECASE)
     
     # Clean up dangling punctuation at start of sentences (from removed phrases)
+    # This removes commas or colons that appear after sentence start markers
     cleaned = re.sub(r"(^|\.|\n)\s*[,:]", r"\1", cleaned)
     
     # Clean up multiple spaces
