@@ -1496,36 +1496,10 @@ if uploaded_files and len(uploaded_files) > 0:
                     )
 
                 st.subheader("Sample per-question results (first 200 rows)")
-                st.info(
-                    "Table shows key columns including: question, gold answer, generated_answer_clean (cleaned), "
-                    "accuracy (EM), F1 score, ROUGE scores, Recall@K, Precision@K, and confidence metrics. "
-                    "Download the full CSV to see all columns."
-                )
-                # Create a focused display with key columns, ensuring accuracy (EM) and recall scores are visible
-                if do_compare_dense_sparse:
-                    key_columns = [
-                        "id", "question", "gold", "generated_answer_clean",
-                        "em", "f1", "rouge_1", "rouge_l",
-                        "recall_at_1_sparse", "recall_at_3_sparse", "recall_at_5_sparse",
-                        "precision_at_1_sparse", "precision_at_3_sparse", "precision_at_5_sparse",
-                        "total_time_sec", "mean_support_score", "low_confidence_flag"
-                    ]
-                else:
-                    key_columns = [
-                        "id", "question", "gold", "generated_answer_clean",
-                        "em", "f1", "rouge_1", "rouge_l",
-                        "recall_at_1", "recall_at_3", "recall_at_5",
-                        "precision_at_1", "precision_at_3", "precision_at_5",
-                        "total_time_sec", "mean_support_score", "low_confidence_flag"
-                    ]
-                # Filter to only show columns that exist in the dataframe
-                display_columns = [col for col in key_columns if col in res_df.columns]
-                st.dataframe(res_df[display_columns].head(200))
-                
-                # Full results for download
+                st.dataframe(res_df.head(200))
                 csv_bytes = res_df.to_csv(index=False).encode("utf-8")
                 st.download_button(
-                    "Download full evaluation CSV (all columns)",
+                    "Download evaluation CSV",
                     data=csv_bytes,
                     file_name="evaluation_results.csv",
                     mime="text/csv"
