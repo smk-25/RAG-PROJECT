@@ -229,8 +229,22 @@ def strip_provenance(text: str) -> str:
     parts = _PROV_SPLIT_RE.split(text)
     cleaned = parts[0] if parts else text
     
+    # Remove complex chunk references like "(, chunk:hash, of 223, )" or "(chunk: hash of 223)"
+    cleaned = re.sub(r"\([,\s]*chunk:?\s*[a-f0-9]*[,\s]*of\s+\d+[,\s]*\)", "", cleaned, flags=re.IGNORECASE)
+    
     # Remove chunk references like (chunk:hash) or (chunk hash)
     cleaned = re.sub(r"\(chunk:?[^\)]*\)", "", cleaned, flags=re.IGNORECASE)
+    
+    # Remove specific "of XXX" patterns that appear as page counts (at end, after comma, or standalone)
+    # Match ", of 223" or "- of 223" or " of 223." but not "total of 5" in middle of text
+    cleaned = re.sub(r"[,\-\s]+of\s+\d+\s*[\.,\)]?(?=\s*[\.,\)\s]|$)", "", cleaned, flags=re.IGNORECASE)
+    
+    # Remove source patterns like "(Source: of 223)" completely - match the entire pattern
+    cleaned = re.sub(r"\(Source:\s*of\s+\d+\s*\)", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\(Source:\s*[,\s]*\)", "", cleaned, flags=re.IGNORECASE)
+    
+    # Remove any remaining "Source:" followed by comma or at boundaries
+    cleaned = re.sub(r"\(?\s*Source:\s*[,\)]?", "", cleaned, flags=re.IGNORECASE)
     
     # Remove bracketed or parenthesized numbers like [1], (2), [3]
     cleaned = re.sub(r"[\[\(]\s*\d+\s*[\]\)]", "", cleaned)
@@ -255,9 +269,19 @@ def strip_provenance(text: str) -> str:
     # with optional punctuation after (comma or colon)
     cleaned = re.sub(r"(?:according\s+to|based\s+on|as\s+per)\s+(?:the\s+)?(?:source|document)s?\s*[,:]?", "", cleaned, flags=re.IGNORECASE)
     
+    # Remove orphaned parentheses with only commas/spaces inside like "(, )" or "( )"
+    cleaned = re.sub(r"\([,\s]*\)", "", cleaned)
+    
+    # Remove orphaned patterns like ",r" specifically when NOT part of valid words
+    # Only remove comma followed by single letter at sentence/clause boundaries
+    cleaned = re.sub(r",\s*([a-z])\s*(?=[,\.\)\s]|$)", r" \1", cleaned, flags=re.IGNORECASE)
+    
     # Clean up dangling punctuation at line/sentence boundaries
     # This removes commas or colons that appear after string start, periods, or newlines
     cleaned = re.sub(r"(^|\.|\n)\s*[,:]", r"\1", cleaned)
+    
+    # Clean up multiple consecutive punctuation marks
+    cleaned = re.sub(r"[,\s]*,[,\s]*,", ",", cleaned)
     
     # Clean up multiple spaces
     cleaned = re.sub(r"\s+", " ", cleaned)
@@ -267,7 +291,11 @@ def strip_provenance(text: str) -> str:
     
     # Remove leading/trailing whitespace and clean up comma/period spacing
     cleaned = cleaned.strip()
-    cleaned = re.sub(r"\s+([,\.])", r"\1", cleaned)
+    cleaned = re.sub(r"\s+([,\.\)])", r"\1", cleaned)
+    cleaned = re.sub(r"([\(])\s+", r"\1", cleaned)
+    
+    # Final pass: remove any remaining standalone commas or periods at start/end
+    cleaned = re.sub(r"^[,\.\s]+|[,\.\s]+$", "", cleaned)
     
     return cleaned
 
