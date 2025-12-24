@@ -641,12 +641,26 @@ def process_pdf(pdf_path: str) -> List[Any]:
     st.write(f"Loaded {len(docs)} pages")
     return docs
 
-def split_documents(documents: List[Any], chunk_size: int = 800, chunk_overlap: int = 128) -> List[Any]:
+def split_documents(documents: List[Any], chunk_size: int = 800, chunk_overlap: int = 128, method: str = "Recursive") -> List[Any]:
+    """
+    Split documents using different chunking strategies.
+    
+    Args:
+        documents: List of documents to split
+        chunk_size: Size of each chunk
+        chunk_overlap: Overlap between chunks
+        method: Chunking method - "Recursive", "Hybrid", or "Fixed-size"
+    
+    Returns:
+        List of split documents
+    """
     if RecursiveCharacterTextSplitter is None:
         out = []
         for d in documents:
             out.append(d)
         return out
+    
+    # Define length function (token-aware if tiktoken is available)
     if tiktoken is not None:
         try:
             enc = tiktoken.get_encoding("cl100k_base")
@@ -658,15 +672,78 @@ def split_documents(documents: List[Any], chunk_size: int = 800, chunk_overlap: 
     else:
         def length_fn(text: str) -> int:
             return max(1, len(text) // 4)
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-        length_function=length_fn,
-        separators=["\n\n", "\n", " "]
-    )
-    split_docs = splitter.split_documents(documents)
-    st.write(f"Split into {len(split_docs)} chunks (token-aware)")
-    return split_docs
+    
+    if method == "Recursive":
+        # Recursive chunking: splits on separators recursively
+        st.write(f"Using Recursive chunking strategy (chunk_size={chunk_size}, overlap={chunk_overlap})")
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            length_function=length_fn,
+            separators=["\n\n", "\n", " ", ""]
+        )
+        split_docs = splitter.split_documents(documents)
+        st.write(f"Split into {len(split_docs)} chunks using Recursive method")
+        return split_docs
+    
+    elif method == "Hybrid":
+        # Hybrid chunking: combine semantic boundaries with fixed-size chunks
+        st.write(f"Using Hybrid chunking strategy (chunk_size={chunk_size}, overlap={chunk_overlap})")
+        
+        # First pass: split on paragraph boundaries (semantic)
+        semantic_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size * 2,  # Larger initial chunks
+            chunk_overlap=0,
+            length_function=length_fn,
+            separators=["\n\n", "\n"]  # Only paragraph/line breaks
+        )
+        semantic_chunks = semantic_splitter.split_documents(documents)
+        
+        # Second pass: if chunks are still too large, split them further with overlap
+        final_chunks = []
+        for doc in semantic_chunks:
+            doc_len = length_fn(doc.page_content)
+            if doc_len > chunk_size:
+                # Split large semantic chunks into smaller fixed-size chunks
+                sub_splitter = RecursiveCharacterTextSplitter(
+                    chunk_size=chunk_size,
+                    chunk_overlap=chunk_overlap,
+                    length_function=length_fn,
+                    separators=[" ", ""]
+                )
+                sub_docs = sub_splitter.split_documents([doc])
+                final_chunks.extend(sub_docs)
+            else:
+                final_chunks.append(doc)
+        
+        st.write(f"Split into {len(final_chunks)} chunks using Hybrid method")
+        return final_chunks
+    
+    elif method == "Fixed-size":
+        # Fixed-size chunking: simple character-based splitting
+        st.write(f"Using Fixed-size chunking strategy (chunk_size={chunk_size}, overlap={chunk_overlap})")
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            length_function=length_fn,
+            separators=[""]  # No semantic separators, just split at size
+        )
+        split_docs = splitter.split_documents(documents)
+        st.write(f"Split into {len(split_docs)} chunks using Fixed-size method")
+        return split_docs
+    
+    else:
+        # Default to recursive if unknown method
+        st.warning(f"Unknown chunking method '{method}', defaulting to Recursive")
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            length_function=length_fn,
+            separators=["\n\n", "\n", " ", ""]
+        )
+        split_docs = splitter.split_documents(documents)
+        st.write(f"Split into {len(split_docs)} chunks")
+        return split_docs
 
 def assemble_context(
     chunks: List[Dict[str, Any]],
@@ -785,6 +862,22 @@ embed_model_name = st.sidebar.text_input("Embedding model", value="all-MiniLM-L6
 cross_model_name = st.sidebar.text_input("Cross-Encoder model (optional)", value="cross-encoder/ms-marco-MiniLM-L-6-v2")
 use_cross = st.sidebar.checkbox("Use Cross-Encoder rerank (if available)", value=True)
 
+# NEW: Chunking strategy controls
+st.sidebar.markdown("### Document Chunking Strategy")
+chunking_method = st.sidebar.selectbox(
+    "Chunking Method",
+    ["Recursive", "Hybrid", "Fixed-size"],
+    help="Recursive: Split on separators recursively. Hybrid: Combine semantic and fixed-size. Fixed-size: Simple fixed-size chunks."
+)
+chunk_size = st.sidebar.number_input(
+    "Chunk size (tokens/characters)",
+    value=800, min_value=100, max_value=2000, step=100
+)
+chunk_overlap = st.sidebar.number_input(
+    "Chunk overlap",
+    value=128, min_value=0, max_value=500, step=32
+)
+
 # NEW: Sparse prefilter controls
 st.sidebar.markdown("### Sparse BM25 Prefilter (Option C)")
 use_sparse_prefilter = st.sidebar.checkbox("Use sparse BM25 prefilter (if available)", value=True)
@@ -880,7 +973,7 @@ if uploaded_files and len(uploaded_files) > 0:
         if not all_pages:
             st.error("No pages loaded.")
         else:
-            chunks = split_documents(all_pages, chunk_size=800, chunk_overlap=128)
+            chunks = split_documents(all_pages, chunk_size=int(chunk_size), chunk_overlap=int(chunk_overlap), method=chunking_method)
 
             @st.cache_resource
             def _emb_mgr(name):
