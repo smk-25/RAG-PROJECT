@@ -229,8 +229,17 @@ def strip_provenance(text: str) -> str:
     parts = _PROV_SPLIT_RE.split(text)
     cleaned = parts[0] if parts else text
     
+    # Remove complex chunk references like "(, chunk:hash, of 223, )" or "(chunk: hash of 223)"
+    cleaned = re.sub(r"\([,\s]*chunk:?\s*[a-f0-9]*[,\s]*of\s+\d+[,\s]*\)", "", cleaned, flags=re.IGNORECASE)
+    
     # Remove chunk references like (chunk:hash) or (chunk hash)
     cleaned = re.sub(r"\(chunk:?[^\)]*\)", "", cleaned, flags=re.IGNORECASE)
+    
+    # Remove "of XXX" page count references (e.g., "of 223")
+    cleaned = re.sub(r"\bof\s+\d+\b", "", cleaned, flags=re.IGNORECASE)
+    
+    # Remove source patterns like "(Source: of 223)" or "(Source:, )"
+    cleaned = re.sub(r"\(Source:\s*[,\s]*\)", "", cleaned, flags=re.IGNORECASE)
     
     # Remove bracketed or parenthesized numbers like [1], (2), [3]
     cleaned = re.sub(r"[\[\(]\s*\d+\s*[\]\)]", "", cleaned)
@@ -255,9 +264,18 @@ def strip_provenance(text: str) -> str:
     # with optional punctuation after (comma or colon)
     cleaned = re.sub(r"(?:according\s+to|based\s+on|as\s+per)\s+(?:the\s+)?(?:source|document)s?\s*[,:]?", "", cleaned, flags=re.IGNORECASE)
     
+    # Remove orphaned parentheses with only commas/spaces inside like "(, )" or "( )"
+    cleaned = re.sub(r"\([,\s]*\)", "", cleaned)
+    
+    # Remove orphaned patterns like ",r" or ", )" at word boundaries
+    cleaned = re.sub(r",\s*[a-z]\b", "", cleaned, flags=re.IGNORECASE)
+    
     # Clean up dangling punctuation at line/sentence boundaries
     # This removes commas or colons that appear after string start, periods, or newlines
     cleaned = re.sub(r"(^|\.|\n)\s*[,:]", r"\1", cleaned)
+    
+    # Clean up multiple consecutive punctuation marks
+    cleaned = re.sub(r"[,\s]*,[,\s]*,", ",", cleaned)
     
     # Clean up multiple spaces
     cleaned = re.sub(r"\s+", " ", cleaned)
@@ -267,7 +285,11 @@ def strip_provenance(text: str) -> str:
     
     # Remove leading/trailing whitespace and clean up comma/period spacing
     cleaned = cleaned.strip()
-    cleaned = re.sub(r"\s+([,\.])", r"\1", cleaned)
+    cleaned = re.sub(r"\s+([,\.\)])", r"\1", cleaned)
+    cleaned = re.sub(r"([\(])\s+", r"\1", cleaned)
+    
+    # Final pass: remove any remaining standalone commas or periods at start/end
+    cleaned = re.sub(r"^[,\.\s]+|[,\.\s]+$", "", cleaned)
     
     return cleaned
 
