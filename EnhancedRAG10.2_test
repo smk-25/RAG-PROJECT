@@ -235,11 +235,16 @@ def strip_provenance(text: str) -> str:
     # Remove chunk references like (chunk:hash) or (chunk hash)
     cleaned = re.sub(r"\(chunk:?[^\)]*\)", "", cleaned, flags=re.IGNORECASE)
     
-    # Remove "of XXX" page count references (e.g., "of 223")
-    cleaned = re.sub(r"\bof\s+\d+\b", "", cleaned, flags=re.IGNORECASE)
+    # Remove specific "of XXX" patterns that appear as page counts (at end, after comma, or standalone)
+    # Match ", of 223" or "- of 223" or " of 223." but not "total of 5" in middle of text
+    cleaned = re.sub(r"[,\-\s]+of\s+\d+\s*[\.,\)]?(?=\s*[\.,\)\s]|$)", "", cleaned, flags=re.IGNORECASE)
     
-    # Remove source patterns like "(Source: of 223)" or "(Source:, )"
+    # Remove source patterns like "(Source: of 223)" completely - match the entire pattern
+    cleaned = re.sub(r"\(Source:\s*of\s+\d+\s*\)", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\(Source:\s*[,\s]*\)", "", cleaned, flags=re.IGNORECASE)
+    
+    # Remove any remaining "Source:" followed by comma or at boundaries
+    cleaned = re.sub(r"\(?\s*Source:\s*[,\)]?", "", cleaned, flags=re.IGNORECASE)
     
     # Remove bracketed or parenthesized numbers like [1], (2), [3]
     cleaned = re.sub(r"[\[\(]\s*\d+\s*[\]\)]", "", cleaned)
@@ -267,8 +272,9 @@ def strip_provenance(text: str) -> str:
     # Remove orphaned parentheses with only commas/spaces inside like "(, )" or "( )"
     cleaned = re.sub(r"\([,\s]*\)", "", cleaned)
     
-    # Remove orphaned patterns like ",r" or ", )" at word boundaries
-    cleaned = re.sub(r",\s*[a-z]\b", "", cleaned, flags=re.IGNORECASE)
+    # Remove orphaned patterns like ",r" specifically when NOT part of valid words
+    # Only remove comma followed by single letter at sentence/clause boundaries
+    cleaned = re.sub(r",\s*([a-z])\s*(?=[,\.\)\s]|$)", r" \1", cleaned, flags=re.IGNORECASE)
     
     # Clean up dangling punctuation at line/sentence boundaries
     # This removes commas or colons that appear after string start, periods, or newlines
