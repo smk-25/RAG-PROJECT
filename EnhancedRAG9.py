@@ -1251,12 +1251,12 @@ if uploaded_files and len(uploaded_files) > 0:
                     )
                     
                     # Set relevance threshold based on scoring method for better discrimination
-                    # BERTScore with rescale_with_baseline=True: use -0.3 as threshold (more lenient)
-                    # Embedding cosine similarity: use 0.4 as threshold (more lenient)
+                    # BERTScore with rescale_with_baseline=True: use -0.5 as threshold (very lenient)
+                    # Embedding cosine similarity: use 0.3 as threshold (very lenient)
                     if sem_method == "bert_score_rescaled":
-                        RELEVANCE_THRESHOLD = -0.3  # More lenient for rescaled scores
+                        RELEVANCE_THRESHOLD = -0.5  # Very lenient for rescaled scores
                     else:
-                        RELEVANCE_THRESHOLD = 0.4  # More lenient for cosine similarity
+                        RELEVANCE_THRESHOLD = 0.3  # Very lenient for cosine similarity
                     
                     # Ensure we have scores for all retrieved texts (safety check)
                     if len(sem_scores) != len(retrieved_texts):
@@ -1282,25 +1282,36 @@ if uploaded_files and len(uploaded_files) > 0:
                             token_overlap = intersection / union if union > 0 else 0.0
                         else:
                             token_overlap = 0.0
-                        has_high_token_overlap = token_overlap >= 0.3  # At least 30% token overlap
+                        has_high_token_overlap = token_overlap >= 0.25  # At least 25% token overlap (more lenient)
+                        has_moderate_token_overlap = token_overlap >= 0.15  # At least 15% token overlap
                         
                         # Signal 3: Semantic similarity above threshold
                         has_semantic_match = score >= RELEVANCE_THRESHOLD
+                        has_weak_semantic_match = score >= (RELEVANCE_THRESHOLD - 0.3)  # Even more lenient
                         
                         # Signal 4: Key terms from gold answer present in retrieved text
                         has_key_terms = False
+                        has_some_key_terms = False
                         if len(gold_key_tokens) >= 2:  # Need at least 2 key tokens
                             key_token_overlap = len(gold_key_tokens & retrieved_tokens) / len(gold_key_tokens)
-                            has_key_terms = key_token_overlap >= 0.5  # At least 50% of key terms present
+                            has_key_terms = key_token_overlap >= 0.4  # At least 40% of key terms present (more lenient)
+                            has_some_key_terms = key_token_overlap >= 0.25  # At least 25% of key terms present
+                        elif len(gold_key_tokens) == 1:  # Only 1 key token
+                            has_key_terms = len(gold_key_tokens & retrieved_tokens) > 0
+                            has_some_key_terms = has_key_terms
                         
                         # Document is relevant if ANY of these conditions are met:
                         # 1. Full exact match (strongest signal)
                         # 2. High semantic similarity
-                        # 3. High token overlap AND (reasonable semantic score OR key terms present)
+                        # 3. High token overlap (>= 25%)
+                        # 4. Moderate token overlap (>= 15%) AND (weak semantic match OR some key terms)
+                        # 5. Key terms present (>= 40%) - even without high token overlap
                         is_relevant = (
                             has_full_exact_match or 
                             has_semantic_match or 
-                            (has_high_token_overlap and (score >= -0.5 or has_key_terms))
+                            has_high_token_overlap or
+                            (has_moderate_token_overlap and (has_weak_semantic_match or has_some_key_terms)) or
+                            has_key_terms
                         )
                         relevance.append(is_relevant)
                     
