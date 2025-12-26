@@ -46,11 +46,11 @@ The previous commit tried to avoid negative values by using `rescale_with_baseli
    ```python
    # OLD (problematic)
    P, R, F = bert_score_fn(retrieved_texts, refs, lang="en", rescale_with_baseline=False)
-   scores = [max(0.0, min(1.0, float(x))) for x in F]  # Clamped to [0,1]
+   scores = [max(0.0, min(1.0, float(x))) for x in F]  # Clamping broke rescaled scores
    
    # NEW (fixed)
    P, R, F = bert_score_fn(retrieved_texts, refs, lang="en", rescale_with_baseline=True)
-   scores = [float(x) for x in F]  # No clamping, allow full range
+   scores = [float(x) for x in F]  # No clamping - rescaled scores can legitimately be negative or >1.0
    ```
 
 2. **Adaptive Thresholds**:
