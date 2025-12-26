@@ -118,6 +118,20 @@ def normalize_text(s: str) -> str:
 def tokenize_simple(s: str) -> List[str]:
     return re.findall(r"\w+", (s or "").lower())
 
+def compute_token_overlap(text1: str, text2: str) -> float:
+    """Compute Jaccard similarity between token sets"""
+    tokens1 = set(tokenize_simple(text1))
+    tokens2 = set(tokenize_simple(text2))
+    if not tokens1 or not tokens2:
+        return 0.0
+    intersection = len(tokens1 & tokens2)
+    union = len(tokens1 | tokens2)
+    return intersection / union if union > 0 else 0.0
+
+# Stopwords for key term extraction
+STOPWORDS = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 
+            'of', 'with', 'is', 'are', 'was', 'were', 'be', 'been', 'being'}
+
 def compute_exact_and_f1(pred: str, gold: str) -> Tuple[int, float]:
     em = 1 if normalize_text(pred) == normalize_text(gold) else 0
     p_tokens = tokenize_simple(pred)
@@ -1248,16 +1262,9 @@ if uploaded_files and len(uploaded_files) > 0:
                     if len(sem_scores) != len(retrieved_texts):
                         sem_scores = [0.0] * len(retrieved_texts)
                     
-                    # Compute token overlap for additional relevance signal
-                    def compute_token_overlap(text1: str, text2: str) -> float:
-                        """Compute Jaccard similarity between token sets"""
-                        tokens1 = set(tokenize_simple(text1))
-                        tokens2 = set(tokenize_simple(text2))
-                        if not tokens1 or not tokens2:
-                            return 0.0
-                        intersection = len(tokens1 & tokens2)
-                        union = len(tokens1 | tokens2)
-                        return intersection / union if union > 0 else 0.0
+                    # Pre-compute gold answer tokens and key tokens (outside loop for efficiency)
+                    gold_tokens = set(tokenize_simple(gold_text))
+                    gold_key_tokens = gold_tokens - STOPWORDS
                     
                     # Determine relevance for each retrieved document based on multiple signals
                     relevance = []
@@ -1275,17 +1282,11 @@ if uploaded_files and len(uploaded_files) > 0:
                         has_semantic_match = score >= RELEVANCE_THRESHOLD
                         
                         # Signal 4: Key terms from gold answer present in retrieved text
-                        gold_tokens = set(tokenize_simple(gold_text))
-                        # Filter out very common words (simple stopword removal)
-                        stopwords = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 
-                                   'of', 'with', 'is', 'are', 'was', 'were', 'be', 'been', 'being'}
-                        gold_key_tokens = gold_tokens - stopwords
+                        has_key_terms = False
                         if len(gold_key_tokens) >= 2:  # Need at least 2 key tokens
                             retrieved_tokens = set(tokenize_simple(retrieved_texts[i]))
                             key_token_overlap = len(gold_key_tokens & retrieved_tokens) / len(gold_key_tokens)
                             has_key_terms = key_token_overlap >= 0.5  # At least 50% of key terms present
-                        else:
-                            has_key_terms = False
                         
                         # Document is relevant if ANY of these conditions are met:
                         # 1. Full exact match (strongest signal)
