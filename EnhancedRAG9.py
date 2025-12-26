@@ -818,20 +818,31 @@ def semantic_scores_for_retrieved(
     embedding_manager: EmbeddingManager,
     use_bertscore: bool
 ):
-    method = "bert_score"
+    """
+    Compute semantic similarity scores for a list of retrieved texts against a gold answer.
+    Uses BERTScore when available and requested (with baseline rescaling for better discrimination),
+    otherwise falls back to embedding cosine similarity.
+
+    Returns:
+      (scores_list, method_name, elapsed_seconds)
+    """
     start = time.time()
     scores = []
     if use_bertscore and BERTSCORE_AVAILABLE and len(retrieved_texts) > 0:
         try:
             refs = [gold] * len(retrieved_texts)
+            # NOTE: use rescale_with_baseline=True for better discrimination.
+            # This rescales scores against a baseline, providing better separation between
+            # relevant and irrelevant documents. Scores can be negative or > 1.0.
             P, R, F = bert_score_fn(retrieved_texts, refs, lang="en", rescale_with_baseline=True)
+            # Do NOT clamp - rescaled scores can and should go outside [0,1] for discrimination
             scores = [float(x) for x in F]
             elapsed = time.time() - start
-            return scores, method, elapsed
+            return scores, "bert_score_rescaled", elapsed
         except Exception:
-            method = "bert_score_failed"
+            # BERTScore failed, will fall through to embedding cosine
+            pass
     # fallback embedding cosine
-    method = "embedding_cosine"
     try:
         texts = [gold] + retrieved_texts
         embs = embedding_manager.generate_embeddings(texts)
@@ -845,7 +856,7 @@ def semantic_scores_for_retrieved(
     except Exception:
         scores = [0.0] * len(retrieved_texts)
     elapsed = time.time() - start
-    return scores, method, elapsed
+    return scores, "embedding_cosine", elapsed
 
 # ------------------------
 # Streamlit App
@@ -1225,9 +1236,13 @@ if uploaded_files and len(uploaded_files) > 0:
                         use_bertscore
                     )
                     
-                    # Set relevance threshold: documents with semantic score >= threshold are considered relevant
-                    # Using 0.5 as a balanced threshold (can be tuned based on evaluation needs)
-                    RELEVANCE_THRESHOLD = 0.5
+                    # Set relevance threshold based on scoring method for better discrimination
+                    # BERTScore with rescale_with_baseline=True: use 0.0 as threshold (baseline-normalized)
+                    # Embedding cosine similarity: use 0.5 as threshold (cosine in [0,1])
+                    if sem_method == "bert_score_rescaled":
+                        RELEVANCE_THRESHOLD = 0.0  # Rescaled scores centered around 0
+                    else:
+                        RELEVANCE_THRESHOLD = 0.5  # Cosine similarity or fallback
                     
                     # Ensure we have scores for all retrieved texts (safety check)
                     if len(sem_scores) != len(retrieved_texts):

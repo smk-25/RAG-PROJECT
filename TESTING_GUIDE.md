@@ -89,40 +89,62 @@ is_relevant = "Paris is the capital of France" in retrieved_text
 - Missed paraphrases
 - Poor scores (~0.03)
 
-### New Behavior (Semantic Similarity)
+### New Behavior (Semantic Similarity with Adaptive Thresholds)
 ```python
-# Matches if semantically similar (>= 0.5) OR contains exact phrase
-semantic_score = compute_similarity(gold_answer, retrieved_text)
-is_relevant = (semantic_score >= 0.5) or (gold_answer in retrieved_text)
+# Compute semantic scores
+sem_scores, sem_method, _ = semantic_scores_for_retrieved(...)
+
+# Adaptive threshold based on method
+if sem_method == "bert_score_rescaled":
+    RELEVANCE_THRESHOLD = 0.0  # Rescaled BERTScore centered around 0
+else:
+    RELEVANCE_THRESHOLD = 0.5  # Cosine similarity in [0,1]
+
+# Matches if semantically similar OR contains exact phrase
+is_relevant = (semantic_score >= RELEVANCE_THRESHOLD) or (gold_answer in retrieved_text)
 ```
-- Captures semantic meaning
+- Captures semantic meaning with better discrimination
+- Uses rescaled BERTScore for wider score range
 - Handles paraphrases
-- Expected scores > 0.3-0.5
+- Expected scores vary by method (rescaled: -1.0 to 2.0, cosine: 0.0 to 1.0)
 
 ## Tuning the Threshold
 
-If you want to adjust the relevance threshold, modify in the code:
+The system uses adaptive thresholds by default, but you can manually adjust:
 
 ```python
 # In compute_retrieval_stats function
-RELEVANCE_THRESHOLD = 0.5  # Default value
+# For rescaled BERTScore (default: 0.0)
+if sem_method == "bert_score_rescaled":
+    RELEVANCE_THRESHOLD = 0.0  # Adjust between -0.5 and 0.5
+    
+# For cosine similarity (default: 0.5)
+else:
+    RELEVANCE_THRESHOLD = 0.5  # Adjust between 0.4 and 0.7
 
-# Lower (e.g., 0.4): More lenient, higher recall, lower precision
-# Higher (e.g., 0.7): More strict, lower recall, higher precision
+# Lower threshold: More lenient, higher recall, lower precision
+# Higher threshold: More strict, lower recall, higher precision
 ```
 
-Recommended range: **0.4 to 0.7**
+Recommended ranges:
+- **Rescaled BERTScore**: -0.5 to 0.5 (default: 0.0)
+- **Cosine similarity**: 0.4 to 0.7 (default: 0.5)
 
 ## Troubleshooting
 
 ### Issue: Scores still low
 - **Check**: Are your test questions answerable from the uploaded documents?
-- **Check**: Is the semantic similarity computation working? (Look for "bert_score_raw" or "embedding_cosine" in method column)
-- **Try**: Lowering the threshold to 0.4
+- **Check**: Is the semantic similarity computation working? (Look for "bert_score_rescaled" or "embedding_cosine" in method column)
+- **Try**: Lowering the threshold (to -0.2 for BERTScore, or 0.4 for cosine)
 
 ### Issue: Scores too high (suspicious)
 - **Check**: Might indicate test questions are too easy or documents contain explicit answers
-- **Try**: Raising the threshold to 0.6 or 0.7
+- **Try**: Raising the threshold (to 0.2 for BERTScore, or 0.6-0.7 for cosine)
+
+### Issue: BERT score variation too small
+- **Fixed**: Now using `rescale_with_baseline=True` which provides better discrimination
+- Scores now range from negative to positive values instead of narrow 0.85-0.95 range
+- If you still see issues, ensure bert-score package is properly installed
 
 ### Issue: BERTScore not available
 - **Check**: Install bert-score: `pip install bert-score`

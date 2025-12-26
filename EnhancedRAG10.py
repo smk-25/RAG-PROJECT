@@ -893,29 +893,29 @@ def semantic_scores_for_retrieved(
 ):
     """
     Compute semantic similarity scores for a list of retrieved texts against a gold answer.
-    Uses BERTScore when available and requested (now using raw scores, not rescaled baseline),
+    Uses BERTScore when available and requested (with baseline rescaling for better discrimination),
     otherwise falls back to embedding cosine similarity.
 
     Returns:
       (scores_list, method_name, elapsed_seconds)
     """
-    method = "bert_score_raw"
     start = time.time()
     scores = []
     if use_bertscore and BERTSCORE_AVAILABLE and len(retrieved_texts) > 0:
         try:
             refs = [gold] * len(retrieved_texts)
-            # NOTE: use rescale_with_baseline=False so output stays in the familiar [0,1] range.
-            # The previous code used rescale_with_baseline=True which can produce negative/rescaled values.
-            P, R, F = bert_score_fn(retrieved_texts, refs, lang="en", rescale_with_baseline=False)
-            # Clamp values to [0,1] for safe downstream aggregation/plots
-            scores = [max(0.0, min(1.0, float(x))) for x in F]
+            # NOTE: use rescale_with_baseline=True for better discrimination.
+            # This rescales scores against a baseline, providing better separation between
+            # relevant and irrelevant documents. Scores can be negative or > 1.0.
+            P, R, F = bert_score_fn(retrieved_texts, refs, lang="en", rescale_with_baseline=True)
+            # Do NOT clamp - rescaled scores can and should go outside [0,1] for discrimination
+            scores = [float(x) for x in F]
             elapsed = time.time() - start
-            return scores, method, elapsed
+            return scores, "bert_score_rescaled", elapsed
         except Exception:
-            method = "bert_score_failed"
+            # BERTScore failed, will fall through to embedding cosine
+            pass
     # fallback embedding cosine
-    method = "embedding_cosine"
     try:
         texts = [gold] + retrieved_texts
         embs = embedding_manager.generate_embeddings(texts)
@@ -929,7 +929,7 @@ def semantic_scores_for_retrieved(
     except Exception:
         scores = [0.0] * len(retrieved_texts)
     elapsed = time.time() - start
-    return scores, method, elapsed
+    return scores, "embedding_cosine", elapsed
 def compute_mean_support_score(results: List[Dict[str, Any]]) -> float:
     """
     Compute a stable mean support score in [0,1].
@@ -1359,9 +1359,13 @@ if uploaded_files and len(uploaded_files) > 0:
                         use_bertscore
                     )
                     
-                    # Set relevance threshold: documents with semantic score >= threshold are considered relevant
-                    # Using 0.5 as a balanced threshold (can be tuned based on evaluation needs)
-                    RELEVANCE_THRESHOLD = 0.5
+                    # Set relevance threshold based on scoring method for better discrimination
+                    # BERTScore with rescale_with_baseline=True: use 0.0 as threshold (baseline-normalized)
+                    # Embedding cosine similarity: use 0.5 as threshold (cosine in [0,1])
+                    if sem_method == "bert_score_rescaled":
+                        RELEVANCE_THRESHOLD = 0.0  # Rescaled scores centered around 0
+                    else:
+                        RELEVANCE_THRESHOLD = 0.5  # Cosine similarity or fallback
                     
                     # Ensure we have scores for all retrieved texts (safety check)
                     if len(sem_scores) != len(retrieved_texts):
