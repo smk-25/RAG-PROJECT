@@ -66,7 +66,7 @@ Click "Download evaluation CSV" to get detailed per-question results including:
 - 1 = Yes, found at least one relevant doc
 - 0 = No relevant docs in top-K
 
-### Relevance Criteria** (UPDATED):
+### Relevance Criteria (UPDATED):
 - Document has semantic similarity >= -0.3 (rescaled BERTScore) or >= 0.4 (cosine) with gold answer, OR
 - Document has 30%+ token overlap (Jaccard) with gold answer AND (reasonable semantic score OR 50%+ key terms present), OR
 - Document contains the exact gold answer as substring
@@ -133,10 +133,10 @@ for i, score in enumerate(sem_scores):
 
 ## Tuning the Thresholds
 
-The system uses multiple thresholds that can be manually adjusted:
+The system uses multiple thresholds that can be manually adjusted in both `EnhancedRAG10.py` and `EnhancedRAG9.py`:
 
 ```python
-# In compute_retrieval_stats function
+# In compute_retrieval_stats function (EnhancedRAG10.py and EnhancedRAG9.py)
 
 # Semantic similarity thresholds (primary)
 if sem_method == "bert_score_rescaled":

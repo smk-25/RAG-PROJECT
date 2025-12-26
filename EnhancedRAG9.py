@@ -1270,12 +1270,18 @@ if uploaded_files and len(uploaded_files) > 0:
                     relevance = []
                     for i, score in enumerate(sem_scores):
                         retrieved_norm = normalize_text(retrieved_texts[i])
+                        retrieved_tokens = set(tokenize_simple(retrieved_texts[i]))  # Tokenize once per document
                         
                         # Signal 1: Full exact substring match
                         has_full_exact_match = gold_norm and gold_norm in retrieved_norm
                         
                         # Signal 2: Token overlap (Jaccard similarity)
-                        token_overlap = compute_token_overlap(gold_text, retrieved_texts[i])
+                        if gold_tokens and retrieved_tokens:
+                            intersection = len(gold_tokens & retrieved_tokens)
+                            union = len(gold_tokens | retrieved_tokens)
+                            token_overlap = intersection / union if union > 0 else 0.0
+                        else:
+                            token_overlap = 0.0
                         has_high_token_overlap = token_overlap >= 0.3  # At least 30% token overlap
                         
                         # Signal 3: Semantic similarity above threshold
@@ -1284,7 +1290,6 @@ if uploaded_files and len(uploaded_files) > 0:
                         # Signal 4: Key terms from gold answer present in retrieved text
                         has_key_terms = False
                         if len(gold_key_tokens) >= 2:  # Need at least 2 key tokens
-                            retrieved_tokens = set(tokenize_simple(retrieved_texts[i]))
                             key_token_overlap = len(gold_key_tokens & retrieved_tokens) / len(gold_key_tokens)
                             has_key_terms = key_token_overlap >= 0.5  # At least 50% of key terms present
                         
