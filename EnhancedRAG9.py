@@ -1237,24 +1237,65 @@ if uploaded_files and len(uploaded_files) > 0:
                     )
                     
                     # Set relevance threshold based on scoring method for better discrimination
-                    # BERTScore with rescale_with_baseline=True: use 0.0 as threshold (baseline-normalized)
-                    # Embedding cosine similarity: use 0.5 as threshold (cosine in [0,1])
+                    # BERTScore with rescale_with_baseline=True: use -0.3 as threshold (more lenient)
+                    # Embedding cosine similarity: use 0.4 as threshold (more lenient)
                     if sem_method == "bert_score_rescaled":
-                        RELEVANCE_THRESHOLD = 0.0  # Rescaled scores centered around 0
+                        RELEVANCE_THRESHOLD = -0.3  # More lenient for rescaled scores
                     else:
-                        RELEVANCE_THRESHOLD = 0.5  # Cosine similarity or fallback
+                        RELEVANCE_THRESHOLD = 0.4  # More lenient for cosine similarity
                     
                     # Ensure we have scores for all retrieved texts (safety check)
                     if len(sem_scores) != len(retrieved_texts):
                         sem_scores = [0.0] * len(retrieved_texts)
                     
-                    # Determine relevance for each retrieved document based on semantic similarity
+                    # Compute token overlap for additional relevance signal
+                    def compute_token_overlap(text1: str, text2: str) -> float:
+                        """Compute Jaccard similarity between token sets"""
+                        tokens1 = set(tokenize_simple(text1))
+                        tokens2 = set(tokenize_simple(text2))
+                        if not tokens1 or not tokens2:
+                            return 0.0
+                        intersection = len(tokens1 & tokens2)
+                        union = len(tokens1 | tokens2)
+                        return intersection / union if union > 0 else 0.0
+                    
+                    # Determine relevance for each retrieved document based on multiple signals
                     relevance = []
                     for i, score in enumerate(sem_scores):
-                        # Also check for exact substring match as a strong signal
-                        has_exact_match = gold_norm and gold_norm in normalize_text(retrieved_texts[i])
-                        # Document is relevant if it has high semantic similarity OR contains exact answer
-                        is_relevant = (score >= RELEVANCE_THRESHOLD) or has_exact_match
+                        retrieved_norm = normalize_text(retrieved_texts[i])
+                        
+                        # Signal 1: Full exact substring match
+                        has_full_exact_match = gold_norm and gold_norm in retrieved_norm
+                        
+                        # Signal 2: Token overlap (Jaccard similarity)
+                        token_overlap = compute_token_overlap(gold_text, retrieved_texts[i])
+                        has_high_token_overlap = token_overlap >= 0.3  # At least 30% token overlap
+                        
+                        # Signal 3: Semantic similarity above threshold
+                        has_semantic_match = score >= RELEVANCE_THRESHOLD
+                        
+                        # Signal 4: Key terms from gold answer present in retrieved text
+                        gold_tokens = set(tokenize_simple(gold_text))
+                        # Filter out very common words (simple stopword removal)
+                        stopwords = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 
+                                   'of', 'with', 'is', 'are', 'was', 'were', 'be', 'been', 'being'}
+                        gold_key_tokens = gold_tokens - stopwords
+                        if len(gold_key_tokens) >= 2:  # Need at least 2 key tokens
+                            retrieved_tokens = set(tokenize_simple(retrieved_texts[i]))
+                            key_token_overlap = len(gold_key_tokens & retrieved_tokens) / len(gold_key_tokens)
+                            has_key_terms = key_token_overlap >= 0.5  # At least 50% of key terms present
+                        else:
+                            has_key_terms = False
+                        
+                        # Document is relevant if ANY of these conditions are met:
+                        # 1. Full exact match (strongest signal)
+                        # 2. High semantic similarity
+                        # 3. High token overlap AND (reasonable semantic score OR key terms present)
+                        is_relevant = (
+                            has_full_exact_match or 
+                            has_semantic_match or 
+                            (has_high_token_overlap and (score >= -0.5 or has_key_terms))
+                        )
                         relevance.append(is_relevant)
                     
                     # Find rank of first relevant document
