@@ -1229,6 +1229,10 @@ if uploaded_files and len(uploaded_files) > 0:
                     # Using 0.5 as a balanced threshold (can be tuned based on evaluation needs)
                     RELEVANCE_THRESHOLD = 0.5
                     
+                    # Ensure we have scores for all retrieved texts (safety check)
+                    if len(sem_scores) != len(retrieved_texts):
+                        sem_scores = [0.0] * len(retrieved_texts)
+                    
                     # Determine relevance for each retrieved document based on semantic similarity
                     relevance = []
                     for i, score in enumerate(sem_scores):
