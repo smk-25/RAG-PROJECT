@@ -822,7 +822,6 @@ def semantic_scores_for_retrieved(
     Returns:
       (scores_list, method_name, elapsed_seconds)
     """
-    method = "bert_score_rescaled"
     start = time.time()
     scores = []
     if use_bertscore and BERTSCORE_AVAILABLE and len(retrieved_texts) > 0:
@@ -835,11 +834,11 @@ def semantic_scores_for_retrieved(
             # Do NOT clamp - rescaled scores can and should go outside [0,1] for discrimination
             scores = [float(x) for x in F]
             elapsed = time.time() - start
-            return scores, method, elapsed
+            return scores, "bert_score_rescaled", elapsed
         except Exception:
-            method = "bert_score_failed"
+            # BERTScore failed, will fall through to embedding cosine
+            pass
     # fallback embedding cosine
-    method = "embedding_cosine"
     try:
         texts = [gold] + retrieved_texts
         embs = embedding_manager.generate_embeddings(texts)
@@ -853,7 +852,7 @@ def semantic_scores_for_retrieved(
     except Exception:
         scores = [0.0] * len(retrieved_texts)
     elapsed = time.time() - start
-    return scores, method, elapsed
+    return scores, "embedding_cosine", elapsed
 def compute_mean_support_score(results: List[Dict[str, Any]]) -> float:
     """
     Compute a stable mean support score in [0,1].
