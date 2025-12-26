@@ -1351,31 +1351,49 @@ if uploaded_files and len(uploaded_files) > 0:
                     retrieved_texts = [c["content"] for c in cand_list]
                     gold_norm = normalize_text(gold_text)
 
+                    # Compute semantic similarity scores for all retrieved texts
+                    sem_scores, sem_method, _ = semantic_scores_for_retrieved(
+                        gold_text,
+                        retrieved_texts,
+                        embedding_manager,
+                        use_bertscore
+                    )
+                    
+                    # Set relevance threshold: documents with semantic score >= threshold are considered relevant
+                    # Using 0.5 as a balanced threshold (can be tuned based on evaluation needs)
+                    RELEVANCE_THRESHOLD = 0.5
+                    
+                    # Determine relevance for each retrieved document based on semantic similarity
+                    relevance = []
+                    for i, score in enumerate(sem_scores):
+                        # Also check for exact substring match as a strong signal
+                        has_exact_match = gold_norm and gold_norm in normalize_text(retrieved_texts[i])
+                        # Document is relevant if it has high semantic similarity OR contains exact answer
+                        is_relevant = (score >= RELEVANCE_THRESHOLD) or has_exact_match
+                        relevance.append(is_relevant)
+                    
+                    # Find rank of first relevant document
                     found_rank = -1
-                    for idx_txt, txt in enumerate(retrieved_texts):
-                        if gold_norm and gold_norm in normalize_text(txt):
-                            found_rank = idx_txt + 1
+                    for idx, is_rel in enumerate(relevance):
+                        if is_rel:
+                            found_rank = idx + 1
                             break
 
                     def recall_at_k(k):
-                        k_eff = min(k, len(retrieved_texts))
+                        """Recall@k: 1 if at least one relevant doc in top-k, 0 otherwise"""
+                        k_eff = min(k, len(relevance))
                         if k_eff <= 0:
                             return 0
-                        return 1 if any(
-                            gold_norm and gold_norm in normalize_text(t)
-                            for t in retrieved_texts[:k_eff]
-                        ) else 0
+                        return 1 if any(relevance[:k_eff]) else 0
 
                     def prec_at_k(k):
-                        k_eff = min(k, len(retrieved_texts))
-                        topk = retrieved_texts[:k_eff]
-                        if len(topk) == 0:
+                        """Precision@k: fraction of top-k that are relevant"""
+                        k_eff = min(k, len(relevance))
+                        if k_eff <= 0:
                             return 0.0
-                        num_rel = sum(
-                            1 for t in topk
-                            if gold_norm and gold_norm in normalize_text(t)
-                        )
-                        return num_rel / len(topk)
+                        topk_relevance = relevance[:k_eff]
+                        num_rel = sum(topk_relevance)
+                        return num_rel / k_eff
 
                     r1 = recall_at_k(1)
                     r3 = recall_at_k(3)
@@ -1385,12 +1403,6 @@ if uploaded_files and len(uploaded_files) > 0:
                     p3 = prec_at_k(3)
                     p5 = prec_at_k(5)
 
-                    sem_scores, sem_method, _ = semantic_scores_for_retrieved(
-                        gold_text,
-                        retrieved_texts,
-                        embedding_manager,
-                        use_bertscore
-                    )
                     if sem_scores:
                         best_sem_idx = int(np.argmax(sem_scores)) + 1
                         best_sem_score = float(np.max(sem_scores))
