@@ -15,3 +15,10 @@ bert-score
 scikit-learn
 tiktoken
 PyPDF2
+pdfplumber
+nltk
+rapidfuzz
+google-genai
+python-docx
+openpyxl
+tabulate
