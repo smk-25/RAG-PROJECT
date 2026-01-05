@@ -98,6 +98,12 @@ Or enter it in the sidebar when the app is running.
   - Ambiguity Scrutiny
 - Vision support for charts/images
 - Benchmarking with CSV evaluation
+- **Confidence Score System** (NEW): Provides quality metrics for each result
+  - Snippet Coverage
+  - Result Coherence
+  - Information Density
+  - Citation Quality
+  - See [CONFIDENCE_SCORE_README.md](./CONFIDENCE_SCORE_README.md) for details
 - Export to TXT, JSON, DOCX, and XLSX formats
 
 ## Port
