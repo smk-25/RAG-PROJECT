@@ -357,6 +357,7 @@ def semantic_chunk_pages(pages: List[str], image_flags: List[bool], model_name: 
             cid += 1
             has_visual = False # Reset for next chunk
             # Keep overlap sentences and their corresponding page numbers
+            # Python slicing is safe: if overlap_sentences > len(buf_sents), it returns all available items
             buf_sents = buf_sents[-overlap_sentences:] if overlap_sentences > 0 else []
             buf_pages = buf_pages[-overlap_sentences:] if overlap_sentences > 0 else []
         
@@ -458,7 +459,7 @@ def get_prompts(mode: str):
                 "Compile an Executive Dashboard of key tender entities. Group by category.",
                 "Return single JSON: {\"dashboard\": {\"Deadlines\": [], \"Financials\": [], \"Locations\": [], \"Contacts\": []}}")
     elif mode == "Ambiguity Scrutiny":
-         return ("IDentify ambiguous, conflicting, or vague clauses that need clarification from the authority.",
+         return ("Identify ambiguous, conflicting, or vague clauses that need clarification from the authority.",
                 "Return JSON array: [{\"clause\": \"...\", \"issue\": \"vague/conflicting/...\", \"suggested_query\": \"formal question for bidder meet\", \"page\": 1}]",
                 "Consolidate a Clarification Request document (Pre-bid queries).",
                 "Return single JSON: {\"queries\": [{\"item\": \"...\", \"conflict\": \"...\", \"query\": \"...\", \"citations\": [pages]}]}")
