@@ -677,7 +677,7 @@ async def call_gemini_vision_async(system_msg: str, user_msg: str, image_bytes: 
 
     return "[Vision Error: Max retries exceeded]"
 
-async def map_phase_async(chunks: List[Dict], query: str, model: str, rpm: int, batch_size: int, mode: str, doc: fitz.Document = None, enable_vision: bool = False):
+async def map_phase_async(chunks: List[Dict], query: str, model: str, rpm: int, batch_size: int, mode: str, doc: fitz.Document = None, enable_vision: bool = False, prompt_instructions: str = ""):
     m_sys, m_ins, _, _ = get_prompts(mode)
     batches = [chunks[i:i+batch_size] for i in range(0, len(chunks), batch_size)]
     
@@ -696,7 +696,12 @@ async def map_phase_async(chunks: List[Dict], query: str, model: str, rpm: int, 
                         )
                         vision_info += f"\n[Vision Insight for Page {c['start_page']}]: {desc}\n"
 
-        prompt = f"{m_ins}\nQuery: {query}\n" 
+        # Prepend user-provided prompt instructions if present
+        prompt = ""
+        if prompt_instructions and prompt_instructions.strip():
+            prompt = f"{prompt_instructions.strip()}\n\n"
+        
+        prompt += f"{m_ins}\nQuery: {query}\n" 
         if vision_info: prompt += f"\nADDITIONAL VISUAL CONTEXT:\n{vision_info}\n"
         prompt += "\n".join([f"ID:{c['id']} P:{c['start_page']} Text:{c['text']}" for c in batch])
         return await call_gemini_json_async(m_sys, prompt, model, rpm)
@@ -708,14 +713,19 @@ async def map_phase_async(chunks: List[Dict], query: str, model: str, rpm: int, 
         elif isinstance(r, dict): out.append(r)
     return [o for o in out if isinstance(o, dict) and "error" not in o]
 
-async def recursive_reduce(items: List[Dict], query: str, model: str, rpm: int, mode: str):
+async def recursive_reduce(items: List[Dict], query: str, model: str, rpm: int, mode: str, prompt_instructions: str = ""):
     m_sys, m_ins, r_sys, r_ins = get_prompts(mode)
     
     if len(items) > 25:
         # Hierarchy: merge chunks into larger intermediate results
         sub_batches = [items[i:i+15] for i in range(0, len(items), 15)]
         async def summarize_sub(batch):
-            prompt = f"Merge and deduplicate these partial {mode} entries for query '{query}'. Keep evidence/snippets intact. Output a JSON array in the format: {m_ins}\n\nData:\n{json.dumps(batch)}"
+            # Prepend user-provided prompt instructions if present
+            prompt = ""
+            if prompt_instructions and prompt_instructions.strip():
+                prompt = f"{prompt_instructions.strip()}\n\n"
+            
+            prompt += f"Merge and deduplicate these partial {mode} entries for query '{query}'. Keep evidence/snippets intact. Output a JSON array in the format: {m_ins}\n\nData:\n{json.dumps(batch)}"
             # Use r_sys for intermediate reduction too, but specify format
             return await call_gemini_json_async(r_sys, prompt, model, rpm)
         
@@ -731,7 +741,12 @@ async def recursive_reduce(items: List[Dict], query: str, model: str, rpm: int, 
             elif isinstance(it, dict):
                 if "error" not in it: items.append(it)
     
-    user_prompt = f"{r_ins}\nQuery: {query}\n\nFindings Data:\n{json.dumps(items)}"
+    # Prepend user-provided prompt instructions if present
+    user_prompt = ""
+    if prompt_instructions and prompt_instructions.strip():
+        user_prompt = f"{prompt_instructions.strip()}\n\n"
+    
+    user_prompt += f"{r_ins}\nQuery: {query}\n\nFindings Data:\n{json.dumps(items)}"
     return await call_gemini_json_async(r_sys, user_prompt, model, rpm)
 
 # --------------------------
@@ -805,7 +820,7 @@ if (uploaded_files and (query_input or "benchmark_df" in st.session_state) and (
             with st.status(f"Processing Query: {q}", expanded=True) as status:
                 t0 = time.time()
                 status.write("Running Map Phase (Scanning chunks)...")
-                mapped = await map_phase_async(chunks, q, model, target_rpm, batch_size, analysis_mode, doc=doc, enable_vision=enable_vision)
+                mapped = await map_phase_async(chunks, q, model, target_rpm, batch_size, analysis_mode, doc=doc, enable_vision=enable_vision, prompt_instructions=prompt_instructions)
                 
                 t1 = time.time()
                 status.write(f"Map phase completed in {t1-t0:.2f}s (Found {len(mapped)} snippets)")
@@ -818,7 +833,7 @@ if (uploaded_files and (query_input or "benchmark_df" in st.session_state) and (
                 
                 t0 = time.time()
                 status.write("Running Reduce Phase (Synthesizing results)...")
-                reduced = await recursive_reduce(mapped, q, model, target_rpm, analysis_mode)
+                reduced = await recursive_reduce(mapped, q, model, target_rpm, analysis_mode, prompt_instructions=prompt_instructions)
                 t1 = time.time()
                 status.write(f"Reduce phase completed in {t1-t0:.2f}s")
                 status.update(label=f"Query Finished: {q}", state="complete", expanded=False)
