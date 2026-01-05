@@ -502,7 +502,8 @@ def compute_confidence_score(mapped_snippets: List[Dict], reduced_result: Dict, 
         elif density_ratio <= 50:
             density_score = min(1.0, density_ratio / 20.0)  # Good range
         else:
-            density_score = max(0.5, 1.0 - (density_ratio - 50) / 200.0)  # Too long
+            # Penalty for overly long results (200.0 provides gradual decay)
+            density_score = max(0.5, 1.0 - (density_ratio - 50) / 200.0)
         confidence["information_density"] = max(0.0, min(1.0, density_score))
     
     # 4. Citation Confidence: Check quality of citations
@@ -513,13 +514,17 @@ def compute_confidence_score(mapped_snippets: List[Dict], reduced_result: Dict, 
         if "matrix" in reduced_result:
             for item in reduced_result["matrix"]:
                 if isinstance(item, dict):
-                    cites = item.get("citations") or [item.get("page")]
-                    if cites: citations.extend(cites if isinstance(cites, list) else [cites])
+                    cites = item.get("citations") or item.get("page")
+                    # Only extend if cites is not None
+                    if cites is not None:
+                        citations.extend(cites if isinstance(cites, list) else [cites])
         elif "risks" in reduced_result:
             for item in reduced_result["risks"]:
                 if isinstance(item, dict):
-                    cites = item.get("citations") or [item.get("page")]
-                    if cites: citations.extend(cites if isinstance(cites, list) else [cites])
+                    cites = item.get("citations") or item.get("page")
+                    # Only extend if cites is not None
+                    if cites is not None:
+                        citations.extend(cites if isinstance(cites, list) else [cites])
     
     # Remove None values and count unique citations
     citations = [c for c in citations if c is not None]

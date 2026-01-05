@@ -117,7 +117,7 @@ Metrics:
 Overall: 89.6% → High Confidence 🎯
 ```
 
-### Scenario 2: Moderate Confidence (26%)
+### Scenario 2: Low Confidence (26%)
 ```
 Input Query: "What are the specific technical requirements?"
 Snippets Found: 1
