@@ -336,7 +336,7 @@ def semantic_chunk_pages(pages: List[str], image_flags: List[bool], model_name: 
 
     chunks = []
     buf_sents = []
-    buf_pages = set()
+    buf_pages = []  # Changed to list to track page order
     has_visual = False
     cid = 1
     
@@ -350,25 +350,26 @@ def semantic_chunk_pages(pages: List[str], image_flags: List[bool], model_name: 
             chunks.append({
                 "id": f"chunk_{cid}", 
                 "text": text, 
-                "start_page": min(buf_pages), 
-                "end_page": max(buf_pages),
+                "start_page": min(buf_pages) if buf_pages else pg, 
+                "end_page": max(buf_pages) if buf_pages else pg,
                 "has_visual": has_visual
             })
             cid += 1
             has_visual = False # Reset for next chunk
+            # Keep overlap sentences and their corresponding page numbers
             buf_sents = buf_sents[-overlap_sentences:] if overlap_sentences > 0 else []
-            buf_pages = {pg}
+            buf_pages = buf_pages[-overlap_sentences:] if overlap_sentences > 0 else []
         
         buf_sents.append(sent)
-        buf_pages.add(pg)
+        buf_pages.append(pg)
         if img_flag: has_visual = True
 
     if buf_sents:
         chunks.append({
             "id": f"chunk_{cid}", 
             "text": " ".join(buf_sents).strip(), 
-            "start_page": min(buf_pages), 
-            "end_page": max(buf_pages),
+            "start_page": min(buf_pages) if buf_pages else 1, 
+            "end_page": max(buf_pages) if buf_pages else 1,
             "has_visual": has_visual
         })
     
@@ -512,48 +513,48 @@ def generate_excel_report(results: List[Dict]):
     """Generate a multi-sheet Excel file for different analysis modes."""
     bio = io.BytesIO()
     try:
+        # Collect all data in a single pass
+        summary_rows = []
+        compliance_rows = []
+        risk_rows = []
+        entity_rows = []
+        
+        for r in results:
+            res = r.get("result", {})
+            mode = r.get("mode")
+            
+            # 1. Summary data (for all modes)
+            summary_rows.append({
+                "Query": r.get("query"),
+                "Mode": mode,
+                "Summary": res.get("summary", "N/A"),
+                "Key_Points": ", ".join(res.get("bullets", []))
+            })
+            
+            # 2. Mode-specific data
+            if mode == "Compliance Matrix":
+                for item in res.get("matrix", []):
+                    compliance_rows.append(item)
+            elif mode == "Risk Assessment":
+                for risk in res.get("risks", []):
+                    risk_rows.append(risk)
+            elif mode == "Entity Dashboard":
+                dash = res.get("dashboard", {})
+                for cat, items in dash.items():
+                    for it in items:
+                        entity_rows.append({"Category": cat, **it})
+        
+        # Write all sheets
         with pd.ExcelWriter(bio, engine='openpyxl') as writer:
-            # 1. Summary Sheet
-            summary_rows = []
-            for r in results:
-                res = r.get("result", {})
-                summary_rows.append({
-                    "Query": r.get("query"),
-                    "Mode": r.get("mode"),
-                    "Summary": res.get("summary", "N/A"),
-                    "Key_Points": ", ".join(res.get("bullets", []))
-                })
             if summary_rows:
                 pd.DataFrame(summary_rows).to_excel(writer, sheet_name="General_Summary", index=False)
-            
-            # 2. Compliance Sheet
-            compliance_rows = []
-            for r in results:
-                if r.get("mode") == "Compliance Matrix":
-                    for item in r.get("result", {}).get("matrix", []):
-                        compliance_rows.append(item)
             if compliance_rows:
                 pd.DataFrame(compliance_rows).to_excel(writer, sheet_name="Compliance_Matrix", index=False)
-            
-            # 3. Risks Sheet
-            risk_rows = []
-            for r in results:
-                if r.get("mode") == "Risk Assessment":
-                    for risk in r.get("result", {}).get("risks", []):
-                        risk_rows.append(risk)
             if risk_rows:
                 pd.DataFrame(risk_rows).to_excel(writer, sheet_name="Risk_Assessment", index=False)
-
-            # 4. Entities Sheet
-            entity_rows = []
-            for r in results:
-                if r.get("mode") == "Entity Dashboard":
-                    dash = r.get("result", {}).get("dashboard", {})
-                    for cat, items in dash.items():
-                        for it in items:
-                            entity_rows.append({"Category": cat, **it})
             if entity_rows:
                 pd.DataFrame(entity_rows).to_excel(writer, sheet_name="Key_Entities", index=False)
+                
     except Exception as e:
         st.error(f"Error generating Excel: {e}")
         return None
