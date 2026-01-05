@@ -1,3 +1,4 @@
+
 # TenderAnalyzer_Consolidated.py
 """
 Streamlit Tender Analyzer (semantic chunking + map/reduce)
@@ -33,7 +34,7 @@ def setup_nltk():
 
 setup_nltk()
 
-st.set_page_config(page_title="Tender Analyzer (Semantic + MapReduce)", layout="wide")
+st.set_page_config(page_title="Tender Analyzer (LLM Driven Semantic + MapReduce Retrieval)", layout="wide")
 
 # --------------------------
 # UI: sidebar config
