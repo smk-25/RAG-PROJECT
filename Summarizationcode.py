@@ -336,7 +336,7 @@ def semantic_chunk_pages(pages: List[str], image_flags: List[bool], model_name: 
 
     chunks = []
     buf_sents = []
-    buf_pages = set()
+    buf_pages = []  # Changed to list to track page order
     has_visual = False
     cid = 1
     
@@ -350,25 +350,27 @@ def semantic_chunk_pages(pages: List[str], image_flags: List[bool], model_name: 
             chunks.append({
                 "id": f"chunk_{cid}", 
                 "text": text, 
-                "start_page": min(buf_pages), 
-                "end_page": max(buf_pages),
+                "start_page": min(buf_pages) if buf_pages else pg, 
+                "end_page": max(buf_pages) if buf_pages else pg,
                 "has_visual": has_visual
             })
             cid += 1
             has_visual = False # Reset for next chunk
+            # Keep overlap sentences and their corresponding page numbers
+            # Python slicing is safe: if overlap_sentences > len(buf_sents), it returns all available items
             buf_sents = buf_sents[-overlap_sentences:] if overlap_sentences > 0 else []
-            buf_pages = {pg}
+            buf_pages = buf_pages[-overlap_sentences:] if overlap_sentences > 0 else []
         
         buf_sents.append(sent)
-        buf_pages.add(pg)
+        buf_pages.append(pg)
         if img_flag: has_visual = True
 
     if buf_sents:
         chunks.append({
             "id": f"chunk_{cid}", 
             "text": " ".join(buf_sents).strip(), 
-            "start_page": min(buf_pages), 
-            "end_page": max(buf_pages),
+            "start_page": min(buf_pages) if buf_pages else 1, 
+            "end_page": max(buf_pages) if buf_pages else 1,
             "has_visual": has_visual
         })
     
@@ -457,7 +459,7 @@ def get_prompts(mode: str):
                 "Compile an Executive Dashboard of key tender entities. Group by category.",
                 "Return single JSON: {\"dashboard\": {\"Deadlines\": [], \"Financials\": [], \"Locations\": [], \"Contacts\": []}}")
     elif mode == "Ambiguity Scrutiny":
-         return ("IDentify ambiguous, conflicting, or vague clauses that need clarification from the authority.",
+         return ("Identify ambiguous, conflicting, or vague clauses that need clarification from the authority.",
                 "Return JSON array: [{\"clause\": \"...\", \"issue\": \"vague/conflicting/...\", \"suggested_query\": \"formal question for bidder meet\", \"page\": 1}]",
                 "Consolidate a Clarification Request document (Pre-bid queries).",
                 "Return single JSON: {\"queries\": [{\"item\": \"...\", \"conflict\": \"...\", \"query\": \"...\", \"citations\": [pages]}]}")
@@ -512,48 +514,48 @@ def generate_excel_report(results: List[Dict]):
     """Generate a multi-sheet Excel file for different analysis modes."""
     bio = io.BytesIO()
     try:
+        # Collect all data in a single pass
+        summary_rows = []
+        compliance_rows = []
+        risk_rows = []
+        entity_rows = []
+        
+        for r in results:
+            res = r.get("result", {})
+            mode = r.get("mode")
+            
+            # 1. Summary data (for all modes)
+            summary_rows.append({
+                "Query": r.get("query"),
+                "Mode": mode,
+                "Summary": res.get("summary", "N/A"),
+                "Key_Points": ", ".join(res.get("bullets", []))
+            })
+            
+            # 2. Mode-specific data
+            if mode == "Compliance Matrix":
+                for item in res.get("matrix", []):
+                    compliance_rows.append(item)
+            elif mode == "Risk Assessment":
+                for risk in res.get("risks", []):
+                    risk_rows.append(risk)
+            elif mode == "Entity Dashboard":
+                dash = res.get("dashboard", {})
+                for cat, items in dash.items():
+                    for it in items:
+                        entity_rows.append({"Category": cat, **it})
+        
+        # Write all sheets
         with pd.ExcelWriter(bio, engine='openpyxl') as writer:
-            # 1. Summary Sheet
-            summary_rows = []
-            for r in results:
-                res = r.get("result", {})
-                summary_rows.append({
-                    "Query": r.get("query"),
-                    "Mode": r.get("mode"),
-                    "Summary": res.get("summary", "N/A"),
-                    "Key_Points": ", ".join(res.get("bullets", []))
-                })
             if summary_rows:
                 pd.DataFrame(summary_rows).to_excel(writer, sheet_name="General_Summary", index=False)
-            
-            # 2. Compliance Sheet
-            compliance_rows = []
-            for r in results:
-                if r.get("mode") == "Compliance Matrix":
-                    for item in r.get("result", {}).get("matrix", []):
-                        compliance_rows.append(item)
             if compliance_rows:
                 pd.DataFrame(compliance_rows).to_excel(writer, sheet_name="Compliance_Matrix", index=False)
-            
-            # 3. Risks Sheet
-            risk_rows = []
-            for r in results:
-                if r.get("mode") == "Risk Assessment":
-                    for risk in r.get("result", {}).get("risks", []):
-                        risk_rows.append(risk)
             if risk_rows:
                 pd.DataFrame(risk_rows).to_excel(writer, sheet_name="Risk_Assessment", index=False)
-
-            # 4. Entities Sheet
-            entity_rows = []
-            for r in results:
-                if r.get("mode") == "Entity Dashboard":
-                    dash = r.get("result", {}).get("dashboard", {})
-                    for cat, items in dash.items():
-                        for it in items:
-                            entity_rows.append({"Category": cat, **it})
             if entity_rows:
                 pd.DataFrame(entity_rows).to_excel(writer, sheet_name="Key_Entities", index=False)
+                
     except Exception as e:
         st.error(f"Error generating Excel: {e}")
         return None
@@ -677,7 +679,7 @@ async def call_gemini_vision_async(system_msg: str, user_msg: str, image_bytes: 
 
     return "[Vision Error: Max retries exceeded]"
 
-async def map_phase_async(chunks: List[Dict], query: str, model: str, rpm: int, batch_size: int, mode: str, doc: fitz.Document = None, enable_vision: bool = False):
+async def map_phase_async(chunks: List[Dict], query: str, model: str, rpm: int, batch_size: int, mode: str, doc: fitz.Document = None, enable_vision: bool = False, prompt_instructions: str = ""):
     m_sys, m_ins, _, _ = get_prompts(mode)
     batches = [chunks[i:i+batch_size] for i in range(0, len(chunks), batch_size)]
     
@@ -696,7 +698,12 @@ async def map_phase_async(chunks: List[Dict], query: str, model: str, rpm: int, 
                         )
                         vision_info += f"\n[Vision Insight for Page {c['start_page']}]: {desc}\n"
 
-        prompt = f"{m_ins}\nQuery: {query}\n" 
+        # Prepend user-provided prompt instructions if present
+        prompt = ""
+        if prompt_instructions and prompt_instructions.strip():
+            prompt = f"{prompt_instructions.strip()}\n\n"
+        
+        prompt += f"{m_ins}\nQuery: {query}\n" 
         if vision_info: prompt += f"\nADDITIONAL VISUAL CONTEXT:\n{vision_info}\n"
         prompt += "\n".join([f"ID:{c['id']} P:{c['start_page']} Text:{c['text']}" for c in batch])
         return await call_gemini_json_async(m_sys, prompt, model, rpm)
@@ -708,14 +715,19 @@ async def map_phase_async(chunks: List[Dict], query: str, model: str, rpm: int, 
         elif isinstance(r, dict): out.append(r)
     return [o for o in out if isinstance(o, dict) and "error" not in o]
 
-async def recursive_reduce(items: List[Dict], query: str, model: str, rpm: int, mode: str):
+async def recursive_reduce(items: List[Dict], query: str, model: str, rpm: int, mode: str, prompt_instructions: str = ""):
     m_sys, m_ins, r_sys, r_ins = get_prompts(mode)
     
     if len(items) > 25:
         # Hierarchy: merge chunks into larger intermediate results
         sub_batches = [items[i:i+15] for i in range(0, len(items), 15)]
         async def summarize_sub(batch):
-            prompt = f"Merge and deduplicate these partial {mode} entries for query '{query}'. Keep evidence/snippets intact. Output a JSON array in the format: {m_ins}\n\nData:\n{json.dumps(batch)}"
+            # Prepend user-provided prompt instructions if present
+            prompt = ""
+            if prompt_instructions and prompt_instructions.strip():
+                prompt = f"{prompt_instructions.strip()}\n\n"
+            
+            prompt += f"Merge and deduplicate these partial {mode} entries for query '{query}'. Keep evidence/snippets intact. Output a JSON array in the format: {m_ins}\n\nData:\n{json.dumps(batch)}"
             # Use r_sys for intermediate reduction too, but specify format
             return await call_gemini_json_async(r_sys, prompt, model, rpm)
         
@@ -731,7 +743,12 @@ async def recursive_reduce(items: List[Dict], query: str, model: str, rpm: int, 
             elif isinstance(it, dict):
                 if "error" not in it: items.append(it)
     
-    user_prompt = f"{r_ins}\nQuery: {query}\n\nFindings Data:\n{json.dumps(items)}"
+    # Prepend user-provided prompt instructions if present
+    user_prompt = ""
+    if prompt_instructions and prompt_instructions.strip():
+        user_prompt = f"{prompt_instructions.strip()}\n\n"
+    
+    user_prompt += f"{r_ins}\nQuery: {query}\n\nFindings Data:\n{json.dumps(items)}"
     return await call_gemini_json_async(r_sys, user_prompt, model, rpm)
 
 # --------------------------
@@ -805,7 +822,7 @@ if (uploaded_files and (query_input or "benchmark_df" in st.session_state) and (
             with st.status(f"Processing Query: {q}", expanded=True) as status:
                 t0 = time.time()
                 status.write("Running Map Phase (Scanning chunks)...")
-                mapped = await map_phase_async(chunks, q, model, target_rpm, batch_size, analysis_mode, doc=doc, enable_vision=enable_vision)
+                mapped = await map_phase_async(chunks, q, model, target_rpm, batch_size, analysis_mode, doc=doc, enable_vision=enable_vision, prompt_instructions=prompt_instructions)
                 
                 t1 = time.time()
                 status.write(f"Map phase completed in {t1-t0:.2f}s (Found {len(mapped)} snippets)")
@@ -818,7 +835,7 @@ if (uploaded_files and (query_input or "benchmark_df" in st.session_state) and (
                 
                 t0 = time.time()
                 status.write("Running Reduce Phase (Synthesizing results)...")
-                reduced = await recursive_reduce(mapped, q, model, target_rpm, analysis_mode)
+                reduced = await recursive_reduce(mapped, q, model, target_rpm, analysis_mode, prompt_instructions=prompt_instructions)
                 t1 = time.time()
                 status.write(f"Reduce phase completed in {t1-t0:.2f}s")
                 status.update(label=f"Query Finished: {q}", state="complete", expanded=False)
