@@ -1,0 +1,34 @@
+[server]
+# Enable file watcher to automatically detect code changes
+fileWatcherType = "auto"
+
+# Enable CORS for development
+enableCORS = false
+
+# Enable XSS protection
+enableXsrfProtection = true
+
+[browser]
+# Gather usage statistics
+gatherUsageStats = false
+
+# Server address
+serverAddress = "0.0.0.0"
+
+# Server port
+serverPort = 8501
+
+[runner]
+# Automatically rerun script when it changes
+magicEnabled = true
+
+# Fast rerun when file changes are detected
+fastReruns = true
+
+[client]
+# Show error details
+showErrorDetails = true
+
+[theme]
+# Use default theme
+base = "light"

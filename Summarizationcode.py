@@ -1,5 +1,5 @@
 
-# TenderAnalyzer_Consolidated.py
+# Summarizationcode.py
 """
 Streamlit Tender Analyzer (semantic chunking + map/reduce)
 - Supports multiple PDF uploads
