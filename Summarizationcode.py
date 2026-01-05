@@ -55,7 +55,7 @@ with st.sidebar:
     # Using unique keys to prevent DuplicateElementId if the script ever re-runs unexpectedly
     model = st.text_input("Model (google-genai)", value="gemini-2.5-flash", key="model_input")
     target_rpm = st.number_input("Target RPM (requests/min)", value=4, min_value=1, key="rpm_input")
-    batch_size = st.number_input("Batch size", value=20, min_value=1, key="batch_input")
+    batch_size = st.number_input("Batch size", value=50, min_value=1, key="batch_input")
     max_tokens_per_chunk = st.number_input("Max tokens per chunk", value=8000, min_value=1000, key="max_tokens_input")
     overlap_sentences = st.number_input("Overlap sentences", value=5, min_value=0, key="overlap_input")
     
