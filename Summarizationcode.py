@@ -39,7 +39,7 @@ st.set_page_config(page_title="Tender Analyzer (LLM Driven Semantic + MapReduce 
 # --------------------------
 # UI: sidebar config
 # --------------------------
-st.title("Tender Analyzer — Semantic Map/Reduce")
+st.title("Tender Analyzer — LLM Driven Semantic Map/Reduce Retrieval")
 st.markdown("Upload one or more tender PDFs, type queries (one per line), and get structured summaries. Uses Gemini (google-genai).")
 
 with st.sidebar:
