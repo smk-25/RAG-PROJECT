@@ -421,6 +421,126 @@ def rouge_l(pred: str, gold: str) -> float:
     prec, rec = lcs/n, lcs/m
     return 2*prec*rec/(prec+rec) if (prec+rec) > 0 else 0.0
 
+def compute_confidence_score(mapped_snippets: List[Dict], reduced_result: Dict, query: str) -> Dict[str, float]:
+    """
+    Compute confidence scores for summarization results.
+    
+    Returns a dictionary with multiple confidence metrics:
+    - snippet_coverage: How well the snippets cover the query (0.0-1.0)
+    - result_coherence: Internal consistency of the result (0.0-1.0)
+    - information_density: Amount of information extracted vs query length (0.0-1.0)
+    - citation_confidence: Quality of citations provided (0.0-1.0)
+    - overall_confidence: Weighted average of all metrics (0.0-1.0)
+    """
+    confidence = {
+        "snippet_coverage": 0.0,
+        "result_coherence": 0.0,
+        "information_density": 0.0,
+        "citation_confidence": 0.0,
+        "overall_confidence": 0.0
+    }
+    
+    # 1. Snippet Coverage: How many snippets were found
+    num_snippets = len(mapped_snippets) if mapped_snippets else 0
+    if num_snippets == 0:
+        return confidence  # All zeros if no snippets found
+    
+    # Normalize snippet count (assume 5+ snippets is good coverage)
+    confidence["snippet_coverage"] = min(1.0, num_snippets / 5.0)
+    
+    # 2. Result Coherence: Check if result has expected structure
+    coherence_score = 0.0
+    if isinstance(reduced_result, dict):
+        # Check for key fields depending on result structure
+        has_summary = bool(reduced_result.get("summary"))
+        has_bullets = bool(reduced_result.get("bullets"))
+        has_citations = bool(reduced_result.get("citations"))
+        has_matrix = bool(reduced_result.get("matrix"))
+        has_risks = bool(reduced_result.get("risks"))
+        has_dashboard = bool(reduced_result.get("dashboard"))
+        has_queries = bool(reduced_result.get("queries"))
+        has_error = "error" in reduced_result
+        
+        # If has error, low coherence
+        if has_error:
+            coherence_score = 0.1
+        else:
+            # Count present fields (at least one should exist)
+            field_count = sum([has_summary, has_bullets, has_citations, 
+                             has_matrix, has_risks, has_dashboard, has_queries])
+            coherence_score = min(1.0, field_count / 2.0)  # 2+ fields = full coherence
+    
+    confidence["result_coherence"] = coherence_score
+    
+    # 3. Information Density: Compare result length to query
+    query_tokens = tokenize_simple(query)
+    result_text = ""
+    
+    if isinstance(reduced_result, dict):
+        # Extract text from various result formats
+        if "summary" in reduced_result:
+            result_text = str(reduced_result.get("summary", ""))
+        elif "matrix" in reduced_result:
+            result_text = json.dumps(reduced_result["matrix"])
+        elif "risks" in reduced_result:
+            result_text = json.dumps(reduced_result["risks"])
+        elif "dashboard" in reduced_result:
+            result_text = json.dumps(reduced_result["dashboard"])
+        elif "queries" in reduced_result:
+            result_text = json.dumps(reduced_result["queries"])
+        elif "_raw" in reduced_result:
+            result_text = str(reduced_result["_raw"])
+    
+    result_tokens = tokenize_simple(result_text)
+    
+    # Good information density: result is 5-50x longer than query
+    if len(query_tokens) > 0 and len(result_tokens) > 0:
+        density_ratio = len(result_tokens) / len(query_tokens)
+        # Sigmoid-like curve: optimal around 10-20x
+        if density_ratio < 2:
+            density_score = density_ratio / 2.0  # Too short
+        elif density_ratio <= 50:
+            density_score = min(1.0, density_ratio / 20.0)  # Good range
+        else:
+            density_score = max(0.5, 1.0 - (density_ratio - 50) / 200.0)  # Too long
+        confidence["information_density"] = max(0.0, min(1.0, density_score))
+    
+    # 4. Citation Confidence: Check quality of citations
+    citations = []
+    if isinstance(reduced_result, dict):
+        citations = reduced_result.get("citations", [])
+        # Also check nested citations in complex structures
+        if "matrix" in reduced_result:
+            for item in reduced_result["matrix"]:
+                if isinstance(item, dict):
+                    cites = item.get("citations") or [item.get("page")]
+                    if cites: citations.extend(cites if isinstance(cites, list) else [cites])
+        elif "risks" in reduced_result:
+            for item in reduced_result["risks"]:
+                if isinstance(item, dict):
+                    cites = item.get("citations") or [item.get("page")]
+                    if cites: citations.extend(cites if isinstance(cites, list) else [cites])
+    
+    # Remove None values and count unique citations
+    citations = [c for c in citations if c is not None]
+    unique_citations = len(set(citations)) if citations else 0
+    
+    # Good citation: at least 1 citation per 3 snippets
+    expected_citations = max(1, num_snippets / 3)
+    citation_ratio = min(1.0, unique_citations / expected_citations)
+    confidence["citation_confidence"] = citation_ratio
+    
+    # 5. Overall Confidence: Weighted average
+    # Weights: snippet coverage (30%), coherence (30%), density (20%), citations (20%)
+    confidence["overall_confidence"] = (
+        0.30 * confidence["snippet_coverage"] +
+        0.30 * confidence["result_coherence"] +
+        0.20 * confidence["information_density"] +
+        0.20 * confidence["citation_confidence"]
+    )
+    
+    return confidence
+
 # --------------------------
 # Prompts & map/reduce (UI-friendly)
 # --------------------------
@@ -524,13 +644,19 @@ def generate_excel_report(results: List[Dict]):
         for r in results:
             res = r.get("result", {})
             mode = r.get("mode")
+            conf = r.get("confidence_scores", {})
             
             # 1. Summary data (for all modes)
             summary_rows.append({
                 "Query": r.get("query"),
                 "Mode": mode,
                 "Summary": res.get("summary", "N/A"),
-                "Key_Points": ", ".join(res.get("bullets", []))
+                "Key_Points": ", ".join(res.get("bullets", [])),
+                "Confidence_Score": round(conf.get("overall_confidence", 0.0), 4) if conf else 0.0,
+                "Snippet_Coverage": round(conf.get("snippet_coverage", 0.0), 4) if conf else 0.0,
+                "Result_Coherence": round(conf.get("result_coherence", 0.0), 4) if conf else 0.0,
+                "Information_Density": round(conf.get("information_density", 0.0), 4) if conf else 0.0,
+                "Citation_Quality": round(conf.get("citation_confidence", 0.0), 4) if conf else 0.0
             })
             
             # 2. Mode-specific data
@@ -841,10 +967,36 @@ if (uploaded_files and (query_input or "benchmark_df" in st.session_state) and (
                 status.write(f"Reduce phase completed in {t1-t0:.2f}s")
                 status.update(label=f"Query Finished: {q}", state="complete", expanded=False)
 
+            # Compute confidence scores
+            confidence_scores = compute_confidence_score(mapped, reduced, q)
+            
             # Display results
             st.subheader(f"Results for: {q}")
             query_total_time = time.time() - t0_bench_start
             st.caption(f"⏱️ Total query time: {query_total_time:.2f}s")
+            
+            # Display confidence indicator
+            overall_conf = confidence_scores["overall_confidence"]
+            if overall_conf >= 0.7:
+                st.success(f"🎯 High Confidence: {overall_conf:.2%} (reliable result)")
+            elif overall_conf >= 0.4:
+                st.info(f"✓ Moderate Confidence: {overall_conf:.2%} (acceptable result)")
+            else:
+                st.warning(f"⚠️ Low Confidence: {overall_conf:.2%} (limited information found)")
+            
+            # Show detailed confidence metrics in expander
+            with st.expander("📊 Confidence Score Breakdown"):
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("Snippet Coverage", f"{confidence_scores['snippet_coverage']:.2%}",
+                             help="How many relevant snippets were found")
+                    st.metric("Information Density", f"{confidence_scores['information_density']:.2%}",
+                             help="Amount of information extracted relative to query")
+                with col2:
+                    st.metric("Result Coherence", f"{confidence_scores['result_coherence']:.2%}",
+                             help="Internal consistency of the result structure")
+                    st.metric("Citation Quality", f"{confidence_scores['citation_confidence']:.2%}",
+                             help="Quality and completeness of citations")
             
             with st.expander("🔍 View Raw Snippets Found", expanded=False):
                 if mapped: st.json(mapped)
@@ -937,7 +1089,12 @@ if (uploaded_files and (query_input or "benchmark_df" in st.session_state) and (
             if all_cites:
                 render_citation_preview(doc, all_cites)
 
-            results.append({"query": q, "mode": analysis_mode, "result": reduced})
+            results.append({
+                "query": q, 
+                "mode": analysis_mode, 
+                "result": reduced,
+                "confidence_scores": confidence_scores
+            })
             
             # --- EVALUATION BLOCK ---
             if is_benchmark and q in ground_truths:
@@ -963,6 +1120,7 @@ if (uploaded_files and (query_input or "benchmark_df" in st.session_state) and (
                     "Recall": round(r, 4),
                     "F1": round(f1, 4),
                     "ROUGE-L": round(rl, 4),
+                    "Confidence": round(confidence_scores["overall_confidence"], 4),
                     "Time (s)": round(time.time() - t0_bench_start, 2),
                     "Status": err_status or "OK"
                 })
@@ -1006,7 +1164,18 @@ if (uploaded_files and (query_input or "benchmark_df" in st.session_state) and (
         for r in results:
             mode = r["mode"]
             res = r["result"]
+            conf = r.get("confidence_scores", {})
             f.write(f"### Query: {r['query']} ({mode})\n")
+            
+            # Write confidence scores
+            if conf:
+                overall_conf = conf.get("overall_confidence", 0.0)
+                f.write(f"\n**Confidence Score: {overall_conf:.2%}**\n")
+                f.write(f"  - Snippet Coverage: {conf.get('snippet_coverage', 0.0):.2%}\n")
+                f.write(f"  - Result Coherence: {conf.get('result_coherence', 0.0):.2%}\n")
+                f.write(f"  - Information Density: {conf.get('information_density', 0.0):.2%}\n")
+                f.write(f"  - Citation Quality: {conf.get('citation_confidence', 0.0):.2%}\n\n")
+            
             if mode == "General Summary":
                 f.write(f"\nSummary:\n{res.get('summary', 'N/A')}\n\nKey Points:\n")
                 for b in res.get("bullets", []): f.write(f"- {b}\n")
