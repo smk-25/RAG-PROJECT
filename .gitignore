@@ -4,6 +4,9 @@ __pycache__/
 *$py.class
 *.so
 
+# Streamlit cache
+.streamlit/secrets.toml
+
 # Virtual environment
 venv/
 env/
