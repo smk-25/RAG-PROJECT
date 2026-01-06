@@ -355,8 +355,8 @@ def semantic_chunk_pages(pages: List[str], image_flags: List[bool], model_name: 
             else:
                 try: 
                     sents = nltk.tokenize.sent_tokenize(par)
-                except (LookupError, Exception):
-                    # Fallback to regex-based sentence splitting if NLTK fails
+                except LookupError:
+                    # NLTK data not available, fallback to regex-based sentence splitting
                     sents = [s.strip() for s in re.split(r'(?<=[.!?])\s+', par) if s.strip()]
                 if sents: sents[0] = f"[Page {idx}] " + sents[0]
                 for s in sents: flat.append((idx, s, has_img))
@@ -1190,7 +1190,7 @@ if (uploaded_files and (query_input or "benchmark_df" in st.session_state) and (
     for p in tmp_paths:
         try: 
             os.unlink(p)
-        except OSError:
+        except (OSError, FileNotFoundError):
             # Ignore file removal errors (file may not exist or permission issues)
             pass
 
