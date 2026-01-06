@@ -100,8 +100,13 @@ if not API_KEY:
     st.warning("No API key provided yet. Enter GOOGLE_API_KEY in sidebar or set environment variable.")
     st.stop()
 
-# Initialize client
-client = genai.Client(api_key=API_KEY)
+# Initialize client with caching
+@st.cache_resource
+def get_genai_client(api_key: str):
+    """Create and cache the genai client for the given API key."""
+    return genai.Client(api_key=api_key)
+
+client = get_genai_client(API_KEY)
 
 # Create debug dir
 DEBUG_DIR = os.path.join(tempfile.gettempdir(), "tender_debug_streamlit_optimized")
@@ -140,9 +145,23 @@ class TokenBucket:
     @property
     def lock(self):
         # Tie the lock to the current event loop to avoid RuntimeError across Streamlit re-runs
-        loop = asyncio.get_event_loop()
-        if self._lock is None or self._lock._loop != loop:
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            # No event loop in current thread, create a new lock
+            if self._lock is None:
+                self._lock = asyncio.Lock()
+            return self._lock
+        
+        # Check if we need a new lock for this event loop
+        # Store the loop id to compare, as locks don't have _loop attribute
+        if not hasattr(self, '_loop_id'):
+            self._loop_id = None
+        
+        current_loop_id = id(loop)
+        if self._lock is None or self._loop_id != current_loop_id:
             self._lock = asyncio.Lock()
+            self._loop_id = current_loop_id
         return self._lock
 
     async def wait(self):
@@ -172,7 +191,9 @@ class TokenBucket:
             # Store in session state for UI feedback (if available)
             try:
                 st.session_state["api_backoff_until"] = time.time() + wait_sec
-            except: pass
+            except Exception:
+                # Session state may not be available in all contexts
+                pass
 
 _rate_limiters = {}
 
@@ -244,7 +265,9 @@ async def call_gemini_json_async(system_msg: str, user_msg: str, model_name: str
                         # Crude parsing for 'retryDelay': '32s'
                         match = re.search(r"retrydelay':\s*'(\d+)s", msg)
                         if match: wait_sec = float(match.group(1)) + 1
-                    except: pass
+                    except (ValueError, AttributeError):
+                        # If parsing fails, use the default backoff
+                        pass
                 
                 # Signal the bucket to stop all threads
                 await limiter.report_429(wait_sec)
@@ -330,15 +353,18 @@ def semantic_chunk_pages(pages: List[str], image_flags: List[bool], model_name: 
                 rows = [f"[Page {idx}] {r.strip()}" for r in par.splitlines() if r.strip()]
                 for r in rows: flat.append((idx, r, has_img))
             else:
-                try: sents = nltk.tokenize.sent_tokenize(par)
-                except: sents = [s.strip() for s in re.split(r'(?<=[.!?])\s+', par) if s.strip()]
+                try: 
+                    sents = nltk.tokenize.sent_tokenize(par)
+                except LookupError:
+                    # NLTK data not available, fallback to regex-based sentence splitting
+                    sents = [s.strip() for s in re.split(r'(?<=[.!?])\s+', par) if s.strip()]
                 if sents: sents[0] = f"[Page {idx}] " + sents[0]
                 for s in sents: flat.append((idx, s, has_img))
 
     chunks = []
     buf_sents = []
-    buf_pages = []  # Changed to list to track page order
-    has_visual = False
+    buf_pages = []  # List to track page numbers corresponding to sentences
+    buf_img_flags = []  # List to track image flags corresponding to sentences
     cid = 1
     
     def get_token_count(text):
@@ -348,6 +374,7 @@ def semantic_chunk_pages(pages: List[str], image_flags: List[bool], model_name: 
         curr_text = " ".join(buf_sents + [sent])
         if get_token_count(curr_text) > max_tokens and buf_sents:
             text = " ".join(buf_sents).strip()
+            has_visual = any(buf_img_flags)  # Check if any sentence in buffer has images
             chunks.append({
                 "id": f"chunk_{cid}", 
                 "text": text, 
@@ -356,17 +383,18 @@ def semantic_chunk_pages(pages: List[str], image_flags: List[bool], model_name: 
                 "has_visual": has_visual
             })
             cid += 1
-            has_visual = False # Reset for next chunk
-            # Keep overlap sentences and their corresponding page numbers
+            # Keep overlap sentences with their corresponding page numbers and image flags
             # Python slicing is safe: if overlap_sentences > len(buf_sents), it returns all available items
             buf_sents = buf_sents[-overlap_sentences:] if overlap_sentences > 0 else []
             buf_pages = buf_pages[-overlap_sentences:] if overlap_sentences > 0 else []
+            buf_img_flags = buf_img_flags[-overlap_sentences:] if overlap_sentences > 0 else []
         
         buf_sents.append(sent)
         buf_pages.append(pg)
-        if img_flag: has_visual = True
+        buf_img_flags.append(img_flag)
 
     if buf_sents:
+        has_visual = any(buf_img_flags)  # Check if any sentence in buffer has images
         chunks.append({
             "id": f"chunk_{cid}", 
             "text": " ".join(buf_sents).strip(), 
@@ -797,7 +825,9 @@ async def call_gemini_vision_async(system_msg: str, user_msg: str, image_bytes: 
                     try:
                         match = re.search(r"retrydelay':\s*'(\d+)s", msg)
                         if match: wait_sec = float(match.group(1)) + 1
-                    except: pass
+                    except (ValueError, AttributeError):
+                        # If parsing fails, use the default backoff
+                        pass
                 
                 await limiter.report_429(wait_sec)
                 await asyncio.sleep(wait_sec)
@@ -1158,8 +1188,11 @@ if (uploaded_files and (query_input or "benchmark_df" in st.session_state) and (
     # Cleanup temp paths
     if doc: doc.close()
     for p in tmp_paths:
-        try: os.unlink(p)
-        except: pass
+        try: 
+            os.unlink(p)
+        except (OSError, FileNotFoundError):
+            # Ignore file removal errors (file may not exist or permission issues)
+            pass
 
     out_txt = os.path.join(tempfile.gettempdir(), "tender_summary_merged.txt")
     out_json = os.path.join(tempfile.gettempdir(), "tender_summary_merged.json")
