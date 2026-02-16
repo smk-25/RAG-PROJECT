@@ -165,55 +165,378 @@ class SparseBM25IndexRAG:
 class RAGRetrieverRAG:
     def __init__(self, vs, em, cross=None, sparse=None, use_s=False, s_k=200):
         self.vs, self.em, self.cross, self.sparse, self.use_s, self.s_k = vs, em, cross, sparse, use_s, s_k
+    
     def retrieve(self, q, top_k=5):
         if not q or not q.strip():
             st.warning("Empty query provided. Please enter a valid question.")
             return []
         
         q_emb = self.em.generate_embeddings([q])[0]
+        
+        # Hybrid retrieval: combine dense and sparse if both available
         if self.use_s and self.sparse and self.sparse.is_ready():
-            cands = self.sparse.get_top_n(q, self.s_k)
+            # Get sparse candidates
+            sparse_cands = self.sparse.get_top_n(q, self.s_k)
+            
+            # Get dense candidates
+            raw = self.vs.collection.query(query_embeddings=[q_emb.tolist()], n_results=100, include=["documents", "metadatas", "embeddings"])
+            if not raw["documents"][0]:
+                st.warning("No documents found in the vector store.")
+                return []
+            dense_cands = [{"id": raw["ids"][0][i], "content": raw["documents"][0][i], "metadata": raw["metadatas"][0][i], "emb": raw["embeddings"][0][i]} for i in range(len(raw["documents"][0]))]
+            
+            # Hybrid fusion: normalize and combine scores
+            cands = self._hybrid_fusion(q_emb, sparse_cands, dense_cands)
         else:
-            raw = self.vs.collection.query(query_embeddings=[q_emb.tolist()], n_results=50, include=["documents", "metadatas", "embeddings"])
+            # Dense-only retrieval
+            raw = self.vs.collection.query(query_embeddings=[q_emb.tolist()], n_results=100, include=["documents", "metadatas", "embeddings"])
             if not raw["documents"][0]:
                 st.warning("No documents found in the vector store.")
                 return []
             cands = [{"id": raw["ids"][0][i], "content": raw["documents"][0][i], "metadata": raw["metadatas"][0][i], "emb": raw["embeddings"][0][i]} for i in range(len(raw["documents"][0]))]
+            
+            # Add similarity scores
+            sims = cosine_similarity([q_emb], [c["emb"] for c in cands])[0]
+            for i, s in enumerate(sims): 
+                cands[i]["similarity_score"] = float(s)
         
         if not cands:
             return []
         
-        sims = cosine_similarity([q_emb], [c["emb"] for c in cands])[0]
-        for i, s in enumerate(sims): cands[i]["similarity_score"] = float(s)
-        res = sorted(cands, key=lambda x: x["similarity_score"], reverse=True)[:top_k]
+        # Apply cross-encoder reranking if available
+        if self.cross is not None:
+            cands = self._rerank_with_cross_encoder(q, cands, top_k * 3)  # Get more candidates before final selection
+        
+        # Return top_k results
+        res = sorted(cands, key=lambda x: x.get("similarity_score", 0.0), reverse=True)[:top_k]
         return res
+    
+    def _hybrid_fusion(self, q_emb, sparse_cands, dense_cands):
+        """Fuse sparse and dense retrieval results using reciprocal rank fusion"""
+        # Create lookup for all candidates
+        all_cands = {}
+        
+        # Normalize sparse scores
+        sparse_scores = [c.get("sparse_score", 0.0) for c in sparse_cands]
+        max_sparse = max(sparse_scores) if sparse_scores else 1.0
+        
+        for rank, c in enumerate(sparse_cands):
+            cid = c.get("id", sha256_text_shared(c.get("content", "")))
+            normalized_sparse = c.get("sparse_score", 0.0) / max(max_sparse, 1e-10)
+            if cid not in all_cands:
+                all_cands[cid] = c.copy()
+                all_cands[cid]["sparse_rank"] = rank
+                all_cands[cid]["sparse_score_norm"] = normalized_sparse
+            else:
+                all_cands[cid]["sparse_rank"] = rank
+                all_cands[cid]["sparse_score_norm"] = normalized_sparse
+        
+        # Add dense scores
+        dense_sims = cosine_similarity([q_emb], [c["emb"] for c in dense_cands])[0]
+        for rank, (c, sim) in enumerate(zip(dense_cands, dense_sims)):
+            cid = c.get("id", sha256_text_shared(c.get("content", "")))
+            if cid not in all_cands:
+                all_cands[cid] = c.copy()
+                all_cands[cid]["dense_rank"] = rank
+                all_cands[cid]["dense_score"] = float(sim)
+            else:
+                all_cands[cid]["dense_rank"] = rank
+                all_cands[cid]["dense_score"] = float(sim)
+        
+        # Reciprocal rank fusion: score = sum(1 / (rank + 60))
+        for cid, c in all_cands.items():
+            sparse_rank = c.get("sparse_rank", 1000)
+            dense_rank = c.get("dense_rank", 1000)
+            rrf_score = (1.0 / (sparse_rank + 60)) + (1.0 / (dense_rank + 60))
+            
+            # Also maintain individual scores for transparency
+            sparse_score_norm = c.get("sparse_score_norm", 0.0)
+            dense_score = c.get("dense_score", 0.0)
+            
+            # Final hybrid score: 0.5 * RRF + 0.3 * dense + 0.2 * sparse
+            c["similarity_score"] = float(0.5 * rrf_score + 0.3 * dense_score + 0.2 * sparse_score_norm)
+        
+        return list(all_cands.values())
+    
+    def _rerank_with_cross_encoder(self, query, candidates, top_n):
+        """Rerank candidates using cross-encoder"""
+        try:
+            pairs = [[query, c["content"]] for c in candidates]
+            scores = self.cross.predict(pairs)
+            
+            for i, score in enumerate(scores):
+                # Keep original similarity_score, add cross_encoder_score
+                candidates[i]["cross_encoder_score"] = float(score)
+                # Update similarity_score to be weighted combination
+                original_score = candidates[i].get("similarity_score", 0.0)
+                candidates[i]["similarity_score"] = 0.4 * original_score + 0.6 * float(score)
+            
+            return sorted(candidates, key=lambda x: x.get("similarity_score", 0.0), reverse=True)[:top_n]
+        except Exception as e:
+            st.warning(f"Cross-encoder reranking failed: {e}")
+            return candidates
 
 class GroqLLMRAG:
     def __init__(self, model="llama-3.1-8b-instant", key=None):
         self.llm = ChatGroq(groq_api_key=key, model_name=model, temperature=0.1)
+    
     def generate_response(self, q, ctx, prompt_instr=""):
-        p = f"{prompt_instr}\n\nContext:\n{ctx}\n\nQuestion: {q}"
+        p = f"{prompt_instr}\n\nContext:\n{ctx}\n\nQuestion: {q}\n\nProvide a clear and concise answer based on the context provided. Include specific details and cite sources when possible."
         return self.llm.invoke([HumanMessage(content=p)]).content
+    
+    def expand_query(self, q):
+        """Generate query variations to improve retrieval"""
+        try:
+            prompt = f"""Given this question: "{q}"
+
+Generate 2 alternative phrasings that capture the same intent but use different words. 
+These will be used for document retrieval.
+
+Respond with only the alternative questions, one per line, without numbering or explanation."""
+            
+            response = self.llm.invoke([HumanMessage(content=prompt)]).content
+            variations = [line.strip() for line in response.strip().split('\n') if line.strip() and not line.strip().startswith(('1.', '2.', '3.', '-', '•'))]
+            
+            # Return original query plus variations (max 3 total)
+            return [q] + variations[:2]
+        except Exception as e:
+            st.warning(f"Query expansion failed: {e}")
+            return [q]  # Fallback to original query
+    
+    def validate_answer(self, q, answer, context):
+        """Validate that the answer is grounded in the context"""
+        try:
+            prompt = f"""Question: {q}
+
+Answer: {answer}
+
+Context: {context[:2000]}
+
+Does the answer accurately reflect information from the context? Respond with only 'YES' or 'NO' followed by a brief explanation."""
+            
+            response = self.llm.invoke([HumanMessage(content=prompt)]).content
+            is_valid = response.strip().upper().startswith('YES')
+            return is_valid, response
+        except Exception:
+            return True, "Validation skipped due to error"
+
 
 def assemble_context_rag(chunks, max_ctx=4096):
-    parts = [f"Source: {c['metadata'].get('source_file')} [{c['id']}]\n{c['content']}" for c in chunks]
+    parts = [f"Source: {c['metadata'].get('source_file')} (Page: {c['metadata'].get('page', 'N/A')}) [ID: {c['id'][:8]}]\n{c['content']}" for c in chunks]
     full_text = "\n\n".join(parts)
     # Enforce max_ctx by truncating if necessary
     if len(full_text) > max_ctx * CHARS_PER_TOKEN_ESTIMATE:
         full_text = full_text[:max_ctx * CHARS_PER_TOKEN_ESTIMATE]
     return full_text, chunks
 
-def map_sentences_to_chunks_rag(answer, used, em):
-    sents = simple_sent_tokenize_shared(answer)
-    if not sents or not used: 
+def multi_query_retrieval(retriever, queries, top_k=5):
+    """Retrieve documents using multiple query variations and fuse results"""
+    all_results = {}
+    
+    for query_idx, query in enumerate(queries):
+        results = retriever.retrieve(query, top_k=top_k * 2)  # Get more results per query
+        
+        for rank, result in enumerate(results):
+            doc_id = result.get("id", sha256_text_shared(result.get("content", "")))
+            
+            if doc_id not in all_results:
+                all_results[doc_id] = result.copy()
+                all_results[doc_id]["query_ranks"] = []
+                all_results[doc_id]["query_scores"] = []
+            
+            all_results[doc_id]["query_ranks"].append(rank)
+            all_results[doc_id]["query_scores"].append(result.get("similarity_score", 0.0))
+    
+    # Fusion: Use reciprocal rank fusion across queries
+    for doc_id, result in all_results.items():
+        ranks = result["query_ranks"]
+        scores = result["query_scores"]
+        
+        # RRF score
+        rrf = sum(1.0 / (r + 60) for r in ranks)
+        # Average score across queries
+        avg_score = sum(scores) / len(scores) if scores else 0.0
+        
+        # Combined score
+        result["similarity_score"] = 0.6 * rrf + 0.4 * avg_score
+        result["num_queries_matched"] = len(ranks)
+    
+    # Sort and return top_k
+    sorted_results = sorted(all_results.values(), 
+                          key=lambda x: x.get("similarity_score", 0.0), 
+                          reverse=True)[:top_k]
+    
+    return sorted_results
+
+
+def extract_sentences_from_chunks(chunks):
+    """Extract sentences from chunks with their positions and metadata"""
+    all_sentences = []
+    for chunk_idx, chunk in enumerate(chunks):
+        content = chunk.get("content", "")
+        sentences = simple_sent_tokenize_shared(content)
+        
+        char_pos = 0
+        for sent in sentences:
+            sent_start = content.find(sent, char_pos)
+            if sent_start == -1:
+                sent_start = char_pos
+            
+            all_sentences.append({
+                "text": sent,
+                "chunk_idx": chunk_idx,
+                "chunk_id": chunk.get("id", ""),
+                "source_file": chunk.get("metadata", {}).get("source_file", ""),
+                "page": chunk.get("metadata", {}).get("page", "N/A"),
+                "char_start": sent_start,
+                "char_end": sent_start + len(sent)
+            })
+            char_pos = sent_start + len(sent)
+    
+    return all_sentences
+
+def map_sentences_to_sources_rag(answer, used, em):
+    """Map answer sentences to specific source sentences with precise citations"""
+    answer_sents = simple_sent_tokenize_shared(answer)
+    if not answer_sents or not used: 
         return []
+    
     try:
-        s_embs = em.generate_embeddings(sents)
-        c_embs = np.vstack([c["emb"] for c in used])
-        sims = cosine_similarity(s_embs, c_embs)
-        return [{"sentence": s, "source": used[int(np.argmax(sims[i]))]["metadata"].get("source_file"), "score": float(np.max(sims[i]))} for i, s in enumerate(sents)]
+        # Extract all sentences from source chunks
+        source_sents = extract_sentences_from_chunks(used)
+        if not source_sents:
+            return []
+        
+        # Generate embeddings
+        answer_embs = em.generate_embeddings(answer_sents)
+        source_texts = [s["text"] for s in source_sents]
+        source_embs = em.generate_embeddings(source_texts)
+        
+        # Compute similarities
+        sims = cosine_similarity(answer_embs, source_embs)
+        
+        # Map each answer sentence to best matching source sentence
+        citations = []
+        for i, ans_sent in enumerate(answer_sents):
+            best_idx = int(np.argmax(sims[i]))
+            best_score = float(sims[i][best_idx])
+            best_source = source_sents[best_idx]
+            
+            citations.append({
+                "answer_sentence": ans_sent,
+                "source_sentence": best_source["text"],
+                "source_file": best_source["source_file"],
+                "page": best_source["page"],
+                "chunk_id": best_source["chunk_id"],
+                "similarity_score": best_score,
+                "char_range": f"{best_source['char_start']}-{best_source['char_end']}"
+            })
+        
+        return citations
     except Exception as e:
-        st.warning(f"Failed to map sentences to chunks: {e}")
+        st.warning(f"Failed to map sentences to sources: {e}")
+        return []
+
+def extract_clauses_from_chunks(chunks):
+    """Extract clause-level segments from chunks for finer-grained citations"""
+    clauses = []
+    
+    # Common clause markers in tender documents
+    clause_patterns = [
+        r'\d+\.\d+(?:\.\d+)?',  # Section numbers like 1.1, 1.2.3
+        r'[A-Z][a-z]+:',  # Headers like "Payment:", "Delivery:"
+        r'\([a-z]\)',  # Sub-clauses like (a), (b)
+        r'[•\-]\s+',  # Bullet points
+    ]
+    combined_pattern = '|'.join(f'({p})' for p in clause_patterns)
+    
+    for chunk_idx, chunk in enumerate(chunks):
+        content = chunk.get("content", "")
+        
+        # Split by clause markers
+        parts = re.split(combined_pattern, content)
+        
+        # Reconstruct clauses with their markers
+        current_clause = ""
+        char_pos = 0
+        
+        for part in parts:
+            if part and part.strip():
+                current_clause += part
+                
+                # If clause is substantial, add it
+                if len(current_clause.strip()) > 50:  # Minimum clause length
+                    clause_start = content.find(current_clause.strip(), char_pos)
+                    if clause_start == -1:
+                        clause_start = char_pos
+                    
+                    clauses.append({
+                        "text": current_clause.strip(),
+                        "chunk_idx": chunk_idx,
+                        "chunk_id": chunk.get("id", ""),
+                        "source_file": chunk.get("metadata", {}).get("source_file", ""),
+                        "page": chunk.get("metadata", {}).get("page", "N/A"),
+                        "char_start": clause_start,
+                        "char_end": clause_start + len(current_clause.strip())
+                    })
+                    
+                    char_pos = clause_start + len(current_clause.strip())
+                    current_clause = ""
+        
+        # Add any remaining clause
+        if current_clause.strip() and len(current_clause.strip()) > 50:
+            clauses.append({
+                "text": current_clause.strip(),
+                "chunk_idx": chunk_idx,
+                "chunk_id": chunk.get("id", ""),
+                "source_file": chunk.get("metadata", {}).get("source_file", ""),
+                "page": chunk.get("metadata", {}).get("page", "N/A"),
+                "char_start": char_pos,
+                "char_end": char_pos + len(current_clause.strip())
+            })
+    
+    return clauses
+
+def map_answer_to_clauses_rag(answer, used, em):
+    """Map answer to clause-level citations"""
+    answer_sents = simple_sent_tokenize_shared(answer)
+    if not answer_sents or not used:
+        return []
+    
+    try:
+        # Extract clauses from source chunks
+        clauses = extract_clauses_from_chunks(used)
+        if not clauses:
+            return []
+        
+        # Generate embeddings
+        answer_embs = em.generate_embeddings(answer_sents)
+        clause_texts = [c["text"] for c in clauses]
+        clause_embs = em.generate_embeddings(clause_texts)
+        
+        # Compute similarities
+        sims = cosine_similarity(answer_embs, clause_embs)
+        
+        # Map each answer sentence to best matching clause
+        clause_citations = []
+        for i, ans_sent in enumerate(answer_sents):
+            best_idx = int(np.argmax(sims[i]))
+            best_score = float(sims[i][best_idx])
+            best_clause = clauses[best_idx]
+            
+            clause_citations.append({
+                "answer_sentence": ans_sent,
+                "source_clause": best_clause["text"][:200] + "..." if len(best_clause["text"]) > 200 else best_clause["text"],
+                "source_file": best_clause["source_file"],
+                "page": best_clause["page"],
+                "chunk_id": best_clause["chunk_id"],
+                "similarity_score": best_score,
+                "char_range": f"{best_clause['char_start']}-{best_clause['char_end']}"
+            })
+        
+        return clause_citations
+    except Exception as e:
+        st.warning(f"Failed to map answer to clauses: {e}")
         return []
 
 # --------------------------
@@ -383,6 +706,16 @@ if choice == "Simple QA (RAG)":
 
     if "rvs" in st.session_state:
         q = st.text_input("Ask a question:", key="rqi")
+        
+        # Add advanced options
+        with st.sidebar:
+            st.markdown("---")
+            st.subheader("Advanced Options")
+            use_query_expansion = st.checkbox("Enable Query Expansion", True, key="rqe")
+            use_answer_validation = st.checkbox("Validate Answer", False, key="rav")
+            show_clause_citations = st.checkbox("Show Clause-Level Citations", True, key="rcc")
+            show_sentence_citations = st.checkbox("Show Sentence-Level Citations", True, key="rsc")
+        
         if q:
             # Validate query length
             if len(q) > MAX_QUERY_LENGTH:
@@ -404,28 +737,82 @@ if choice == "Simple QA (RAG)":
                         st.warning("Cross-encoder not available. Install: pip install sentence-transformers")
                     cr = None
                 
+                # Initialize LLM and retriever
+                llm = GroqLLMRAG(key=ga_key)
                 ret = RAGRetrieverRAG(st.session_state["rvs"], st.session_state["sem"], cr, sparse=st.session_state.get("rbm"), use_s=u_spa)
-                res = ret.retrieve(q, top_k)
+                
+                # Query expansion if enabled
+                if use_query_expansion:
+                    with st.spinner("Expanding query..."):
+                        queries = llm.expand_query(q)
+                        if len(queries) > 1:
+                            st.info(f"Using {len(queries)} query variations for improved retrieval")
+                            with st.expander("Query Variations"):
+                                for i, qvar in enumerate(queries):
+                                    st.write(f"{i+1}. {qvar}")
+                    
+                    # Multi-query retrieval
+                    res = multi_query_retrieval(ret, queries, top_k=top_k)
+                else:
+                    # Standard retrieval
+                    res = ret.retrieve(q, top_k)
                 
                 if not res:
                     st.warning("No relevant documents found for your query. Try rephrasing or check if documents are properly indexed.")
                     st.stop()
                 
+                # Display retrieved context info
+                with st.expander("📚 Retrieved Context Chunks"):
+                    for i, chunk in enumerate(res):
+                        st.markdown(f"**Chunk {i+1}** (Score: {chunk.get('similarity_score', 0):.3f})")
+                        st.markdown(f"*Source: {chunk['metadata'].get('source_file')} | Page: {chunk['metadata'].get('page', 'N/A')}*")
+                        st.text(chunk['content'][:300] + "..." if len(chunk['content']) > 300 else chunk['content'])
+                        st.markdown("---")
+                
+                # Generate answer
                 ctx, used = assemble_context_rag(res, max_ctx=max_tk)
-                llm = GroqLLMRAG(key=ga_key)
                 ans = llm.generate_response(q, ctx)
+                
+                # Answer validation if enabled
+                if use_answer_validation:
+                    with st.spinner("Validating answer..."):
+                        is_valid, validation_msg = llm.validate_answer(q, ans, ctx)
+                        if not is_valid:
+                            st.warning(f"⚠️ Answer validation: {validation_msg}")
+                
+                # Display answer
                 st.subheader("Answer")
                 st.write(strip_provenance(ans))
+                
+                # Confidence score
                 supp = compute_mean_support_score_shared(res)
                 if supp < supp_th:
                     st.warning(f"Low confidence support: {supp:.2f}")
                 else:
                     st.success(f"Strong support: {supp:.2f}")
-                s_map = map_sentences_to_chunks_rag(strip_provenance(ans), used, st.session_state["sem"])
-                if s_map:
-                    with st.expander("Sentence Citations"):
-                        for m in s_map:
-                            st.write(f"- {m['sentence']} ({m['source']}, {m['score']:.2f})")
+                
+                # Clause-level citations
+                if show_clause_citations:
+                    clause_map = map_answer_to_clauses_rag(strip_provenance(ans), used, st.session_state["sem"])
+                    if clause_map:
+                        with st.expander("📋 Clause-Level Citations", expanded=True):
+                            for i, m in enumerate(clause_map):
+                                st.markdown(f"**Answer Sentence {i+1}:** {m['answer_sentence']}")
+                                st.markdown(f"**Source Clause:** {m['source_clause']}")
+                                st.caption(f"Source: {m['source_file']} | Page: {m['page']} | Score: {m['similarity_score']:.3f} | Chars: {m['char_range']}")
+                                st.markdown("---")
+                
+                # Sentence-level citations
+                if show_sentence_citations:
+                    sent_map = map_sentences_to_sources_rag(strip_provenance(ans), used, st.session_state["sem"])
+                    if sent_map:
+                        with st.expander("📝 Sentence-Level Citations"):
+                            for i, m in enumerate(sent_map):
+                                st.markdown(f"**Answer:** {m['answer_sentence']}")
+                                st.markdown(f"**Source:** {m['source_sentence']}")
+                                st.caption(f"File: {m['source_file']} | Page: {m['page']} | Score: {m['similarity_score']:.3f} | Chars: {m['char_range']}")
+                                st.markdown("---")
+
 
 else:
     st.title("Tender Analyzer — Gemini Map/Reduce")
