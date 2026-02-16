@@ -12,8 +12,6 @@ import importlib
 import pickle
 import tempfile
 import asyncio
-import collections
-import io
 import random
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
@@ -70,6 +68,17 @@ except Exception:
     BM25_AVAILABLE = False
 
 # --------------------------
+# Constants
+# --------------------------
+MAX_FILE_SIZE_MB = 50
+MAX_QUERY_LENGTH = 5000
+DEFAULT_RATE_LIMIT_SLEEP = 60.0  # seconds per request at 1 RPM
+ZOOM_LEVEL = 1.5
+MAX_CHUNK_TOKENS = 4096
+DEFAULT_EMBEDDING_DIM = 384
+CHARS_PER_TOKEN_ESTIMATE = 4
+
+# --------------------------
 # Initialization
 # --------------------------
 @st.cache_resource
@@ -78,7 +87,9 @@ def setup_nltk_shared():
         nltk.download('punkt', quiet=True)
         nltk.download('punkt_tab', quiet=True)
         return True
-    except Exception: return False
+    except Exception as e:
+        st.warning(f"Failed to download NLTK data: {e}")
+        return False
 
 _NLTK_READY = setup_nltk_shared()
 
@@ -155,12 +166,22 @@ class RAGRetrieverRAG:
     def __init__(self, vs, em, cross=None, sparse=None, use_s=False, s_k=200):
         self.vs, self.em, self.cross, self.sparse, self.use_s, self.s_k = vs, em, cross, sparse, use_s, s_k
     def retrieve(self, q, top_k=5):
+        if not q or not q.strip():
+            st.warning("Empty query provided. Please enter a valid question.")
+            return []
+        
         q_emb = self.em.generate_embeddings([q])[0]
         if self.use_s and self.sparse and self.sparse.is_ready():
             cands = self.sparse.get_top_n(q, self.s_k)
         else:
             raw = self.vs.collection.query(query_embeddings=[q_emb.tolist()], n_results=50, include=["documents", "metadatas", "embeddings"])
+            if not raw["documents"][0]:
+                st.warning("No documents found in the vector store.")
+                return []
             cands = [{"id": raw["ids"][0][i], "content": raw["documents"][0][i], "metadata": raw["metadatas"][0][i], "emb": raw["embeddings"][0][i]} for i in range(len(raw["documents"][0]))]
+        
+        if not cands:
+            return []
         
         sims = cosine_similarity([q_emb], [c["emb"] for c in cands])[0]
         for i, s in enumerate(sims): cands[i]["similarity_score"] = float(s)
@@ -176,17 +197,24 @@ class GroqLLMRAG:
 
 def assemble_context_rag(chunks, max_ctx=4096):
     parts = [f"Source: {c['metadata'].get('source_file')} [{c['id']}]\n{c['content']}" for c in chunks]
-    return "\n\n".join(parts), chunks
+    full_text = "\n\n".join(parts)
+    # Enforce max_ctx by truncating if necessary
+    if len(full_text) > max_ctx * CHARS_PER_TOKEN_ESTIMATE:
+        full_text = full_text[:max_ctx * CHARS_PER_TOKEN_ESTIMATE]
+    return full_text, chunks
 
 def map_sentences_to_chunks_rag(answer, used, em):
     sents = simple_sent_tokenize_shared(answer)
-    if not sents or not used: return []
+    if not sents or not used: 
+        return []
     try:
         s_embs = em.generate_embeddings(sents)
         c_embs = np.vstack([c["emb"] for c in used])
         sims = cosine_similarity(s_embs, c_embs)
         return [{"sentence": s, "source": used[int(np.argmax(sims[i]))]["metadata"].get("source_file"), "score": float(np.max(sims[i]))} for i, s in enumerate(sents)]
-    except Exception: return []
+    except Exception as e:
+        st.warning(f"Failed to map sentences to chunks: {e}")
+        return []
 
 # --------------------------
 # Summarization Components
@@ -194,34 +222,52 @@ def map_sentences_to_chunks_rag(answer, used, em):
 GLOBAL_SUM_CONCURRENCY = asyncio.Semaphore(2)
 
 async def call_gemini_json_sum_async(client, sys, user, model, rpm):
-    await asyncio.sleep(60.0/max(1, rpm)) # Simplistic rate control
+    await asyncio.sleep(DEFAULT_RATE_LIMIT_SLEEP / max(1, rpm))  # Proper rate limiting
     async with GLOBAL_SUM_CONCURRENCY:
         try:
             from google.genai import types
             resp = await client.aio.models.generate_content(model=model, contents=user, config=types.GenerateContentConfig(system_instruction=sys, response_mime_type="application/json"))
             txt = resp.text or "{}"
             if "```json" in txt: txt = txt.split("```json")[1].split("```")[0].strip()
-            return json.loads(txt)
-        except Exception as e: return {"error": str(e)}
+            parsed = json.loads(txt)
+            return parsed
+        except json.JSONDecodeError as e:
+            return {"error": f"Invalid JSON response: {str(e)}"}
+        except Exception as e:
+            return {"error": f"API call failed: {str(e)}"}
 
 def extract_pages_sum(path):
-    doc = fitz.open(path)
-    p, f = [], []
-    with pdfplumber.open(path) as pl:
-        for i, page in enumerate(doc):
-            t = page.get_text()
-            if i < len(pl.pages):
-                tabs = pl.pages[i].extract_tables()
-                for tab in tabs:
-                    if tab: t += f"\n\n[TABLE]\n{pd.DataFrame(tab).to_markdown()}\n"
-            p.append(t); f.append(len(page.get_images()) > 0)
-    doc.close()
-    return p, f
+    doc = None
+    try:
+        doc = fitz.open(path)
+        p, f = [], []
+        # pdfplumber context manager handles its own cleanup
+        with pdfplumber.open(path) as pl_doc:
+            for i, page in enumerate(doc):
+                t = page.get_text()
+                if i < len(pl_doc.pages):
+                    tabs = pl_doc.pages[i].extract_tables()
+                    for tab in tabs:
+                        if tab: t += f"\n\n[TABLE]\n{pd.DataFrame(tab).to_markdown()}\n"
+                p.append(t); f.append(len(page.get_images()) > 0)
+        return p, f
+    finally:
+        if doc:
+            doc.close()
 
 def semantic_chunk_pages_sum(pages, flags, max_tok=8000, overlap=5):
     flat = []
     for i, p in enumerate(pages):
-        for s in nltk.sent_tokenize(p): flat.append((i+1, s, flags[i]))
+        if _NLTK_READY:
+            try:
+                sents = nltk.sent_tokenize(p)
+            except Exception:
+                # Fallback to simple sentence tokenization if NLTK fails
+                sents = simple_sent_tokenize_shared(p)
+        else:
+            sents = simple_sent_tokenize_shared(p)
+        for s in sents:
+            flat.append((i+1, s, flags[i]))
     chunks, bs, bp, bf = [], [], [], []
     for p, s, f in flat:
         if sum(len(x)//4 for x in bs + [s]) > max_tok and bs:
@@ -247,14 +293,18 @@ def compute_confidence_score_sum(mapped, reduced, q):
     return c
 
 def render_citation_preview_sum(doc, cites):
-    if not cites: return
+    if not cites or not doc: 
+        return
     st.markdown("### 📄 Context Preview")
     tabs = st.tabs([f"Page {c['page']}" for c in cites[:5]])
     for i, c in enumerate(cites[:5]):
         with tabs[i]:
-            page = doc.load_page(c['page'] - 1)
-            pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
-            st.image(pix.tobytes("png"))
+            try:
+                page = doc.load_page(c['page'] - 1)
+                pix = page.get_pixmap(matrix=fitz.Matrix(ZOOM_LEVEL, ZOOM_LEVEL))
+                st.image(pix.tobytes("png"))
+            except Exception as e:
+                st.error(f"Failed to load page {c['page']}: {e}")
 
 # --------------------------
 # Main Program logic
@@ -279,42 +329,103 @@ if choice == "Simple QA (RAG)":
 
     files = st.file_uploader("Upload PDFs", type="pdf", accept_multiple_files=True, key="rfl")
     if files:
+        # Validate file sizes
+        for f in files:
+            file_size_mb = len(f.getvalue()) / (1024 * 1024)
+            if file_size_mb > MAX_FILE_SIZE_MB:
+                st.error(f"File {f.name} exceeds maximum size of {MAX_FILE_SIZE_MB}MB (size: {file_size_mb:.1f}MB)")
+                st.stop()
+        
         if st.button("Index / Re-index", key="rib"):
+            if not LANGCHAIN_AVAILABLE:
+                st.error("LangChain libraries are not available. Please install them: pip install langchain langchain-community pypdf")
+                st.stop()
+            
             with st.spinner("Indexing..."):
                 em = EmbeddingManagerRAG(emb_m); vs = VectorStoreRAG()
                 all_chunks = []
                 for f in files:
                     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as t:
-                        t.write(f.getbuffer()); h = sha256_file_shared(t.name)
-                        ldr = PyPDFLoader(t.name); docs = ldr.load()
-                        for d in docs: d.metadata.update({"file_hash":h, "source_file":f.name})
-                        all_chunks.extend(RecursiveCharacterTextSplitter(chunk_size=c_size, chunk_overlap=c_over).split_documents(docs))
+                        try:
+                            t.write(f.getbuffer())
+                            t.flush()
+                            h = sha256_file_shared(t.name)
+                            ldr = PyPDFLoader(t.name)
+                            docs = ldr.load()
+                            for d in docs:
+                                d.metadata.update({"file_hash": h, "source_file": f.name})
+                            all_chunks.extend(RecursiveCharacterTextSplitter(chunk_size=c_size, chunk_overlap=c_over).split_documents(docs))
+                        finally:
+                            # Ensure temporary file is deleted
+                            # Failures are acceptable here as the OS may have already cleaned up
+                            try:
+                                os.unlink(t.name)
+                            except Exception:
+                                pass  # File may already be deleted
+                
+                if not all_chunks:
+                    st.error("No content could be extracted from the uploaded files.")
+                    st.stop()
+                
                 texts = [c.page_content for c in all_chunks]
-                embs = em.generate_embeddings(texts); vs.add_documents(all_chunks, embs)
+                embs = em.generate_embeddings(texts)
+                vs.add_documents(all_chunks, embs)
                 st.session_state["rvs"], st.session_state["sem"] = vs, em
-                if u_spa:
-                    bm = SparseBM25IndexRAG(); bm.build(all_chunks, embs); st.session_state["rbm"] = bm
+                
+                if u_spa and BM25_AVAILABLE:
+                    bm = SparseBM25IndexRAG()
+                    bm.build(all_chunks, embs)
+                    st.session_state["rbm"] = bm
+                elif u_spa and not BM25_AVAILABLE:
+                    st.warning("BM25 is not available. Sparse retrieval disabled. Install: pip install rank-bm25")
+                
                 st.success("Indexing Success!")
 
     if "rvs" in st.session_state:
         q = st.text_input("Ask a question:", key="rqi")
-        if q and ga_key:
+        if q:
+            # Validate query length
+            if len(q) > MAX_QUERY_LENGTH:
+                st.error(f"Query exceeds maximum length of {MAX_QUERY_LENGTH} characters")
+                st.stop()
+            
+            if not ga_key:
+                st.error("Please provide a Groq API Key in the sidebar")
+                st.stop()
+            
             with st.spinner("Thinking..."):
-                cr = CrossEncoder(crs_m) if u_crs else None
+                # Cache cross-encoder model in session state
+                if u_crs and CROSS_ENCODER_AVAILABLE:
+                    if "cross_encoder" not in st.session_state:
+                        st.session_state["cross_encoder"] = CrossEncoder(crs_m)
+                    cr = st.session_state["cross_encoder"]
+                else:
+                    if u_crs and not CROSS_ENCODER_AVAILABLE:
+                        st.warning("Cross-encoder not available. Install: pip install sentence-transformers")
+                    cr = None
+                
                 ret = RAGRetrieverRAG(st.session_state["rvs"], st.session_state["sem"], cr, sparse=st.session_state.get("rbm"), use_s=u_spa)
                 res = ret.retrieve(q, top_k)
+                
+                if not res:
+                    st.warning("No relevant documents found for your query. Try rephrasing or check if documents are properly indexed.")
+                    st.stop()
+                
                 ctx, used = assemble_context_rag(res, max_ctx=max_tk)
                 llm = GroqLLMRAG(key=ga_key)
                 ans = llm.generate_response(q, ctx)
                 st.subheader("Answer")
                 st.write(strip_provenance(ans))
                 supp = compute_mean_support_score_shared(res)
-                if supp < supp_th: st.warning(f"Low confidence support: {supp:.2f}")
-                else: st.success(f"Strong support: {supp:.2f}")
+                if supp < supp_th:
+                    st.warning(f"Low confidence support: {supp:.2f}")
+                else:
+                    st.success(f"Strong support: {supp:.2f}")
                 s_map = map_sentences_to_chunks_rag(strip_provenance(ans), used, st.session_state["sem"])
                 if s_map:
                     with st.expander("Sentence Citations"):
-                        for m in s_map: st.write(f"- {m['sentence']} ({m['source']}, {m['score']:.2f})")
+                        for m in s_map:
+                            st.write(f"- {m['sentence']} ({m['source']}, {m['score']:.2f})")
 
 else:
     st.title("Tender Analyzer — Gemini Map/Reduce")
@@ -331,13 +442,55 @@ else:
 
     f_sum = st.file_uploader("Upload PDFs", type="pdf", accept_multiple_files=True, key="sf")
     q_sum = st.text_area("Queries (one per line):", key="sq")
-    if st.button("Analyze", key="sab") and f_sum and gem_key:
+    
+    if st.button("Analyze", key="sab"):
+        if not f_sum:
+            st.error("Please upload at least one PDF file")
+            st.stop()
+        if not gem_key:
+            st.error("Please provide a Google API Key in the sidebar")
+            st.stop()
+        if not q_sum or not q_sum.strip():
+            st.error("Please provide at least one query")
+            st.stop()
+        
+        # Validate file sizes
+        for f in f_sum:
+            file_size_mb = len(f.getvalue()) / (1024 * 1024)
+            if file_size_mb > MAX_FILE_SIZE_MB:
+                st.error(f"File {f.name} exceeds maximum size of {MAX_FILE_SIZE_MB}MB (size: {file_size_mb:.1f}MB)")
+                st.stop()
+        
         client = genai.Client(api_key=gem_key)
         all_p, all_f = [], []
-        for f in f_sum:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as t:
-                t.write(f.getbuffer()); p, fl = extract_pages_sum(t.name); all_p.extend(p); all_f.extend(fl)
-        chunks = semantic_chunk_pages_sum(all_p, all_f, max_tok=s_max_tk, overlap=s_over)
+        temp_files = []
+        
+        try:
+            for f in f_sum:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as t:
+                    temp_files.append(t.name)
+                    t.write(f.getbuffer())
+                    t.flush()
+                    p, fl = extract_pages_sum(t.name)
+                    all_p.extend(p)
+                    all_f.extend(fl)
+            
+            if not all_p:
+                st.error("No content could be extracted from the uploaded files")
+                st.stop()
+            
+            chunks = semantic_chunk_pages_sum(all_p, all_f, max_tok=s_max_tk, overlap=s_over)
+            
+            if not chunks:
+                st.error("No chunks could be created from the extracted content")
+                st.stop()
+        finally:
+            # Clean up temporary files
+            for temp_file in temp_files:
+                try:
+                    os.unlink(temp_file)
+                except Exception:
+                    pass
         
         async def run_sum():
             ms, mi, rs, ri = get_sum_prompts(s_obj)
@@ -345,7 +498,11 @@ else:
             instr = s_prompt.strip() + "\n\n" if s_prompt.strip() else ""
             batches = [chunks[i:i+s_batch] for i in range(0, len(chunks), s_batch)]
             for q in q_sum.splitlines():
-                if not q.strip(): continue
+                if not q.strip(): 
+                    continue
+                if len(q) > MAX_QUERY_LENGTH:
+                    st.warning(f"Skipping query (too long): {q[:100]}...")
+                    continue
                 t0 = time.time()
                 m_tasks = []
                 for b in batches:
@@ -361,6 +518,12 @@ else:
         for r in final_res:
             st.subheader(f"Query: {r['query']}")
             st.caption(f"⏱️ Map: {r['map_t']:.2f}s | Reduce: {r['red_t']:.2f}s")
+            
+            # Check for errors in result
+            if isinstance(r["result"], dict) and "error" in r["result"]:
+                st.error(f"Error processing query: {r['result']['error']}")
+                continue
+            
             st.json(r["result"])
             conf = compute_confidence_score_sum(r['mapped'], r['result'], r['query'])
             st.info(f"Confidence: {conf['overall_confidence']:.2%}")
@@ -371,10 +534,24 @@ else:
                 if isinstance(o, dict):
                     for k, v in o.items():
                         if k in ["page", "citations"]:
-                            if isinstance(v, list): [pgs.append(x) for x in v if isinstance(x, int)]
-                            elif isinstance(v, int): pgs.append(v)
-                        else: _f(v)
-                elif isinstance(o, list): [_f(x) for x in o]
+                            if isinstance(v, list):
+                                for x in v:
+                                    if isinstance(x, int):
+                                        pgs.append(x)
+                            elif isinstance(v, int):
+                                pgs.append(v)
+                        else:
+                            _f(v)
+                elif isinstance(o, list):
+                    for x in o:
+                        _f(x)
             _f(r['result'])
-            if pgs: render_citation_preview_sum(fitz.open(stream=f_sum[0].getvalue(), filetype="pdf"), [{"page": p} for p in set(pgs)])
+            
+            if pgs and f_sum:
+                try:
+                    pdf_doc = fitz.open(stream=f_sum[0].getvalue(), filetype="pdf")
+                    render_citation_preview_sum(pdf_doc, [{"page": p} for p in set(pgs)])
+                    pdf_doc.close()
+                except Exception as e:
+                    st.error(f"Failed to load PDF for preview: {e}")
 
