@@ -20,4 +20,4 @@ PyPDF2
 nltk
 numpy
 pandas
-google-generativeai
+google-genai
