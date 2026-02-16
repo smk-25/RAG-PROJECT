@@ -9,9 +9,15 @@ transformers==4.57.1
 torch
 pymupdf
 pypdf
+pdfplumber
+python-docx
 rank-bm25
 matplotlib
 bert-score
 scikit-learn
 tiktoken
 PyPDF2
+nltk
+numpy
+pandas
+google-generativeai

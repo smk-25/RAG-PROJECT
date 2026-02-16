@@ -72,10 +72,11 @@ except Exception:
 # --------------------------
 MAX_FILE_SIZE_MB = 50
 MAX_QUERY_LENGTH = 5000
-DEFAULT_RATE_LIMIT_SLEEP = 15.0  # seconds
+DEFAULT_RATE_LIMIT_SLEEP = 60.0  # seconds per request at 1 RPM
 ZOOM_LEVEL = 1.5
-MAX_CHUNK_TOKEN = 4096
+MAX_CHUNK_TOKENS = 4096
 DEFAULT_EMBEDDING_DIM = 384
+CHARS_PER_TOKEN_ESTIMATE = 4
 
 # --------------------------
 # Initialization
@@ -198,8 +199,8 @@ def assemble_context_rag(chunks, max_ctx=4096):
     parts = [f"Source: {c['metadata'].get('source_file')} [{c['id']}]\n{c['content']}" for c in chunks]
     full_text = "\n\n".join(parts)
     # Enforce max_ctx by truncating if necessary
-    if len(full_text) > max_ctx * 4:  # Rough approximation: 1 token ≈ 4 chars
-        full_text = full_text[:max_ctx * 4]
+    if len(full_text) > max_ctx * CHARS_PER_TOKEN_ESTIMATE:
+        full_text = full_text[:max_ctx * CHARS_PER_TOKEN_ESTIMATE]
     return full_text, chunks
 
 def map_sentences_to_chunks_rag(answer, used, em):
@@ -221,7 +222,7 @@ def map_sentences_to_chunks_rag(answer, used, em):
 GLOBAL_SUM_CONCURRENCY = asyncio.Semaphore(2)
 
 async def call_gemini_json_sum_async(client, sys, user, model, rpm):
-    await asyncio.sleep(DEFAULT_RATE_LIMIT_SLEEP / max(1, rpm))  # Simplistic rate control
+    await asyncio.sleep(DEFAULT_RATE_LIMIT_SLEEP / max(1, rpm))  # Proper rate limiting
     async with GLOBAL_SUM_CONCURRENCY:
         try:
             from google.genai import types
@@ -237,10 +238,10 @@ async def call_gemini_json_sum_async(client, sys, user, model, rpm):
 
 def extract_pages_sum(path):
     doc = None
-    pl_doc = None
     try:
         doc = fitz.open(path)
         p, f = [], []
+        # pdfplumber context manager handles its own cleanup
         with pdfplumber.open(path) as pl_doc:
             for i, page in enumerate(doc):
                 t = page.get_text()
@@ -356,10 +357,11 @@ if choice == "Simple QA (RAG)":
                             all_chunks.extend(RecursiveCharacterTextSplitter(chunk_size=c_size, chunk_overlap=c_over).split_documents(docs))
                         finally:
                             # Ensure temporary file is deleted
+                            # Failures are acceptable here as the OS may have already cleaned up
                             try:
                                 os.unlink(t.name)
                             except Exception:
-                                pass
+                                pass  # File may already be deleted
                 
                 if not all_chunks:
                     st.error("No content could be extracted from the uploaded files.")
@@ -532,14 +534,17 @@ else:
                 if isinstance(o, dict):
                     for k, v in o.items():
                         if k in ["page", "citations"]:
-                            if isinstance(v, list): 
-                                [pgs.append(x) for x in v if isinstance(x, int)]
-                            elif isinstance(v, int): 
+                            if isinstance(v, list):
+                                for x in v:
+                                    if isinstance(x, int):
+                                        pgs.append(x)
+                            elif isinstance(v, int):
                                 pgs.append(v)
-                        else: 
+                        else:
                             _f(v)
-                elif isinstance(o, list): 
-                    [_f(x) for x in o]
+                elif isinstance(o, list):
+                    for x in o:
+                        _f(x)
             _f(r['result'])
             
             if pgs and f_sum:
