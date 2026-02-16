@@ -78,6 +78,21 @@ MAX_CHUNK_TOKENS = 4096
 DEFAULT_EMBEDDING_DIM = 384
 CHARS_PER_TOKEN_ESTIMATE = 4
 
+# RAG Retrieval Constants
+RRF_RANK_CONSTANT = 60  # Constant k for reciprocal rank fusion: score = 1/(rank + k)
+HYBRID_FUSION_RRF_WEIGHT = 0.5  # Weight for RRF score in hybrid fusion
+HYBRID_FUSION_DENSE_WEIGHT = 0.3  # Weight for dense similarity score
+HYBRID_FUSION_SPARSE_WEIGHT = 0.2  # Weight for sparse (BM25) score
+CROSS_ENCODER_WEIGHT = 0.6  # Weight for cross-encoder score in reranking
+ORIGINAL_SCORE_WEIGHT = 0.4  # Weight for original similarity score in reranking
+MULTI_QUERY_RRF_WEIGHT = 0.6  # Weight for RRF in multi-query fusion
+MULTI_QUERY_AVG_WEIGHT = 0.4  # Weight for average score in multi-query fusion
+
+# Citation Constants
+MIN_CLAUSE_LENGTH = 50  # Minimum character length for a valid clause
+ANSWER_VALIDATION_CONTEXT_CHARS = 2000  # Max context chars for answer validation
+
+
 # --------------------------
 # Initialization
 # --------------------------
@@ -243,18 +258,22 @@ class RAGRetrieverRAG:
                 all_cands[cid]["dense_rank"] = rank
                 all_cands[cid]["dense_score"] = float(sim)
         
-        # Reciprocal rank fusion: score = sum(1 / (rank + 60))
+        # Reciprocal rank fusion: score = sum(1 / (rank + k))
         for cid, c in all_cands.items():
             sparse_rank = c.get("sparse_rank", 1000)
             dense_rank = c.get("dense_rank", 1000)
-            rrf_score = (1.0 / (sparse_rank + 60)) + (1.0 / (dense_rank + 60))
+            rrf_score = (1.0 / (sparse_rank + RRF_RANK_CONSTANT)) + (1.0 / (dense_rank + RRF_RANK_CONSTANT))
             
             # Also maintain individual scores for transparency
             sparse_score_norm = c.get("sparse_score_norm", 0.0)
             dense_score = c.get("dense_score", 0.0)
             
-            # Final hybrid score: 0.5 * RRF + 0.3 * dense + 0.2 * sparse
-            c["similarity_score"] = float(0.5 * rrf_score + 0.3 * dense_score + 0.2 * sparse_score_norm)
+            # Final hybrid score with weighted combination
+            c["similarity_score"] = float(
+                HYBRID_FUSION_RRF_WEIGHT * rrf_score + 
+                HYBRID_FUSION_DENSE_WEIGHT * dense_score + 
+                HYBRID_FUSION_SPARSE_WEIGHT * sparse_score_norm
+            )
         
         return list(all_cands.values())
     
@@ -269,7 +288,10 @@ class RAGRetrieverRAG:
                 candidates[i]["cross_encoder_score"] = float(score)
                 # Update similarity_score to be weighted combination
                 original_score = candidates[i].get("similarity_score", 0.0)
-                candidates[i]["similarity_score"] = 0.4 * original_score + 0.6 * float(score)
+                candidates[i]["similarity_score"] = (
+                    ORIGINAL_SCORE_WEIGHT * original_score + 
+                    CROSS_ENCODER_WEIGHT * float(score)
+                )
             
             return sorted(candidates, key=lambda x: x.get("similarity_score", 0.0), reverse=True)[:top_n]
         except Exception as e:
@@ -310,7 +332,7 @@ Respond with only the alternative questions, one per line, without numbering or 
 
 Answer: {answer}
 
-Context: {context[:2000]}
+Context: {context[:ANSWER_VALIDATION_CONTEXT_CHARS]}
 
 Does the answer accurately reflect information from the context? Respond with only 'YES' or 'NO' followed by a brief explanation."""
             
@@ -353,12 +375,12 @@ def multi_query_retrieval(retriever, queries, top_k=5):
         scores = result["query_scores"]
         
         # RRF score
-        rrf = sum(1.0 / (r + 60) for r in ranks)
+        rrf = sum(1.0 / (r + RRF_RANK_CONSTANT) for r in ranks)
         # Average score across queries
         avg_score = sum(scores) / len(scores) if scores else 0.0
         
-        # Combined score
-        result["similarity_score"] = 0.6 * rrf + 0.4 * avg_score
+        # Combined score with weighted fusion
+        result["similarity_score"] = MULTI_QUERY_RRF_WEIGHT * rrf + MULTI_QUERY_AVG_WEIGHT * avg_score
         result["num_queries_matched"] = len(ranks)
     
     # Sort and return top_k
@@ -465,7 +487,7 @@ def extract_clauses_from_chunks(chunks):
                 current_clause += part
                 
                 # If clause is substantial, add it
-                if len(current_clause.strip()) > 50:  # Minimum clause length
+                if len(current_clause.strip()) > MIN_CLAUSE_LENGTH:
                     clause_start = content.find(current_clause.strip(), char_pos)
                     if clause_start == -1:
                         clause_start = char_pos
@@ -484,7 +506,7 @@ def extract_clauses_from_chunks(chunks):
                     current_clause = ""
         
         # Add any remaining clause
-        if current_clause.strip() and len(current_clause.strip()) > 50:
+        if current_clause.strip() and len(current_clause.strip()) > MIN_CLAUSE_LENGTH:
             clauses.append({
                 "text": current_clause.strip(),
                 "chunk_idx": chunk_idx,
