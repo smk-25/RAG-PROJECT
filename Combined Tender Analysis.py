@@ -94,10 +94,17 @@ ANSWER_VALIDATION_CONTEXT_CHARS = 2000  # Max context chars for answer validatio
 MAX_CLAUSE_DISPLAY_LENGTH = 200  # Max chars to display for clause text in citations
 MAX_CHUNK_PREVIEW_LENGTH = 300  # Max chars to display for chunk preview in UI
 
+# Retrieval parameters
+DENSE_RETRIEVAL_CANDIDATES = 100  # Number of candidates to retrieve using dense embeddings
+DEFAULT_MISSING_RANK = 1000  # Penalty rank for candidates missing from one retrieval method
+MAX_QUERY_VARIATIONS = 2  # Maximum number of query variations to generate (in addition to original)
+MULTI_QUERY_RETRIEVAL_MULTIPLIER = 2  # Multiplier for retrieving more results per query
+CROSS_ENCODER_CANDIDATE_MULTIPLIER = 3  # Multiplier for candidates before cross-encoder reranking
+
 # Clause extraction patterns for tender documents
 CLAUSE_PATTERNS = [
     r'\d+\.\d+(?:\.\d+)?',  # Section numbers like 1.1, 1.2.3
-    r'[A-Z][a-z]+:',  # Headers like "Payment:", "Delivery:"
+    r'[A-Z][A-Za-z\s]+:',  # Headers like "Payment:", "PAYMENT:", "Payment Terms:"
     r'\([a-z]\)',  # Sub-clauses like (a), (b)
     r'[•\-]\s+',  # Bullet points
 ]
@@ -204,7 +211,7 @@ class RAGRetrieverRAG:
             sparse_cands = self.sparse.get_top_n(q, self.s_k)
             
             # Get dense candidates
-            raw = self.vs.collection.query(query_embeddings=[q_emb.tolist()], n_results=100, include=["documents", "metadatas", "embeddings"])
+            raw = self.vs.collection.query(query_embeddings=[q_emb.tolist()], n_results=DENSE_RETRIEVAL_CANDIDATES, include=["documents", "metadatas", "embeddings"])
             if not raw["documents"][0]:
                 st.warning("No documents found in the vector store.")
                 return []
@@ -214,7 +221,7 @@ class RAGRetrieverRAG:
             cands = self._hybrid_fusion(q_emb, sparse_cands, dense_cands)
         else:
             # Dense-only retrieval
-            raw = self.vs.collection.query(query_embeddings=[q_emb.tolist()], n_results=100, include=["documents", "metadatas", "embeddings"])
+            raw = self.vs.collection.query(query_embeddings=[q_emb.tolist()], n_results=DENSE_RETRIEVAL_CANDIDATES, include=["documents", "metadatas", "embeddings"])
             if not raw["documents"][0]:
                 st.warning("No documents found in the vector store.")
                 return []
@@ -230,7 +237,7 @@ class RAGRetrieverRAG:
         
         # Apply cross-encoder reranking if available
         if self.cross is not None:
-            cands = self._rerank_with_cross_encoder(q, cands, top_k * 3)  # Get more candidates before final selection
+            cands = self._rerank_with_cross_encoder(q, cands, top_k * CROSS_ENCODER_CANDIDATE_MULTIPLIER)
         
         # Return top_k results
         res = sorted(cands, key=lambda x: x.get("similarity_score", 0.0), reverse=True)[:top_k]
@@ -270,8 +277,8 @@ class RAGRetrieverRAG:
         
         # Reciprocal rank fusion: score = sum(1 / (rank + k))
         for cid, c in all_cands.items():
-            sparse_rank = c.get("sparse_rank", 1000)
-            dense_rank = c.get("dense_rank", 1000)
+            sparse_rank = c.get("sparse_rank", DEFAULT_MISSING_RANK)
+            dense_rank = c.get("dense_rank", DEFAULT_MISSING_RANK)
             rrf_score = (1.0 / (sparse_rank + RRF_RANK_CONSTANT)) + (1.0 / (dense_rank + RRF_RANK_CONSTANT))
             
             # Also maintain individual scores for transparency
@@ -313,7 +320,8 @@ class GroqLLMRAG:
         self.llm = ChatGroq(groq_api_key=key, model_name=model, temperature=0.1)
     
     def generate_response(self, q, ctx, prompt_instr=""):
-        p = f"{prompt_instr}\n\nContext:\n{ctx}\n\nQuestion: {q}\n\nProvide a clear and concise answer based on the context provided. Include specific details and cite sources when possible."
+        # Note: Citation logic is handled separately by dedicated citation functions
+        p = f"{prompt_instr}\n\nContext:\n{ctx}\n\nQuestion: {q}\n\nProvide a clear and concise answer based on the context provided."
         return self.llm.invoke([HumanMessage(content=p)]).content
     
     def expand_query(self, q):
@@ -321,16 +329,18 @@ class GroqLLMRAG:
         try:
             prompt = f"""Given this question: "{q}"
 
-Generate 2 alternative phrasings that capture the same intent but use different words. 
+Generate {MAX_QUERY_VARIATIONS} alternative phrasings that capture the same intent but use different words. 
 These will be used for document retrieval.
 
-Respond with only the alternative questions, one per line, without numbering or explanation."""
+Respond with only the alternative questions, one per line, without any numbering, bullets, or explanation."""
             
             response = self.llm.invoke([HumanMessage(content=prompt)]).content
-            variations = [line.strip() for line in response.strip().split('\n') if line.strip() and not line.strip().startswith(('1.', '2.', '3.', '-', '•'))]
+            # Filter out lines that look like numbered/bulleted lists
+            variations = [line.strip() for line in response.strip().split('\n') 
+                         if line.strip() and not re.match(r'^[\d\w][\.\)\:]', line.strip())]
             
-            # Return original query plus variations (max 3 total)
-            return [q] + variations[:2]
+            # Return original query plus variations
+            return [q] + variations[:MAX_QUERY_VARIATIONS]
         except Exception as e:
             st.warning(f"Query expansion failed: {e}")
             return [q]  # Fallback to original query
@@ -366,7 +376,7 @@ def multi_query_retrieval(retriever, queries, top_k=5):
     all_results = {}
     
     for query_idx, query in enumerate(queries):
-        results = retriever.retrieve(query, top_k=top_k * 2)  # Get more results per query
+        results = retriever.retrieve(query, top_k=top_k * MULTI_QUERY_RETRIEVAL_MULTIPLIER)
         
         for rank, result in enumerate(results):
             doc_id = result.get("id", sha256_text_shared(result.get("content", "")))
