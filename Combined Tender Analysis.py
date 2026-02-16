@@ -1,5 +1,5 @@
 
-# Summarizationcode.py
+# Combined Tender Analysis.py
 """
 Streamlit Tender Analyzer (semantic chunking + map/reduce)
 - Supports multiple PDF uploads
@@ -777,7 +777,7 @@ def render_citation_preview(doc, citations):
     tabs = st.tabs([f"Page {p}" for p in display_pages])
     for i, p in enumerate(display_pages):
         with tabs[i]:
-            # Use the first snack available for that page for highlighting
+            # Use the first snippet available for that page for highlighting
             snippets = [s for s in grouped[p] if s]
             text_to_highlight = snippets[0] if snippets else None
             
