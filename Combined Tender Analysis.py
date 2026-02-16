@@ -91,6 +91,16 @@ MULTI_QUERY_AVG_WEIGHT = 0.4  # Weight for average score in multi-query fusion
 # Citation Constants
 MIN_CLAUSE_LENGTH = 50  # Minimum character length for a valid clause
 ANSWER_VALIDATION_CONTEXT_CHARS = 2000  # Max context chars for answer validation
+MAX_CLAUSE_DISPLAY_LENGTH = 200  # Max chars to display for clause text in citations
+MAX_CHUNK_PREVIEW_LENGTH = 300  # Max chars to display for chunk preview in UI
+
+# Clause extraction patterns for tender documents
+CLAUSE_PATTERNS = [
+    r'\d+\.\d+(?:\.\d+)?',  # Section numbers like 1.1, 1.2.3
+    r'[A-Z][a-z]+:',  # Headers like "Payment:", "Delivery:"
+    r'\([a-z]\)',  # Sub-clauses like (a), (b)
+    r'[•\-]\s+',  # Bullet points
+]
 
 
 # --------------------------
@@ -463,14 +473,8 @@ def extract_clauses_from_chunks(chunks):
     """Extract clause-level segments from chunks for finer-grained citations"""
     clauses = []
     
-    # Common clause markers in tender documents
-    clause_patterns = [
-        r'\d+\.\d+(?:\.\d+)?',  # Section numbers like 1.1, 1.2.3
-        r'[A-Z][a-z]+:',  # Headers like "Payment:", "Delivery:"
-        r'\([a-z]\)',  # Sub-clauses like (a), (b)
-        r'[•\-]\s+',  # Bullet points
-    ]
-    combined_pattern = '|'.join(f'({p})' for p in clause_patterns)
+    # Use module-level clause patterns
+    combined_pattern = '|'.join(f'({p})' for p in CLAUSE_PATTERNS)
     
     for chunk_idx, chunk in enumerate(chunks):
         content = chunk.get("content", "")
@@ -546,9 +550,14 @@ def map_answer_to_clauses_rag(answer, used, em):
             best_score = float(sims[i][best_idx])
             best_clause = clauses[best_idx]
             
+            # Truncate clause text for display if too long
+            clause_text = best_clause["text"]
+            if len(clause_text) > MAX_CLAUSE_DISPLAY_LENGTH:
+                clause_text = clause_text[:MAX_CLAUSE_DISPLAY_LENGTH] + "..."
+            
             clause_citations.append({
                 "answer_sentence": ans_sent,
-                "source_clause": best_clause["text"][:200] + "..." if len(best_clause["text"]) > 200 else best_clause["text"],
+                "source_clause": clause_text,
                 "source_file": best_clause["source_file"],
                 "page": best_clause["page"],
                 "chunk_id": best_clause["chunk_id"],
@@ -788,7 +797,11 @@ if choice == "Simple QA (RAG)":
                     for i, chunk in enumerate(res):
                         st.markdown(f"**Chunk {i+1}** (Score: {chunk.get('similarity_score', 0):.3f})")
                         st.markdown(f"*Source: {chunk['metadata'].get('source_file')} | Page: {chunk['metadata'].get('page', 'N/A')}*")
-                        st.text(chunk['content'][:300] + "..." if len(chunk['content']) > 300 else chunk['content'])
+                        # Show preview with truncation if needed
+                        content = chunk['content']
+                        if len(content) > MAX_CHUNK_PREVIEW_LENGTH:
+                            content = content[:MAX_CHUNK_PREVIEW_LENGTH] + "..."
+                        st.text(content)
                         st.markdown("---")
                 
                 # Generate answer
