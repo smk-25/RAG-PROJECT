@@ -1519,7 +1519,19 @@ async def call_gemini_json_sum_async(client, sys, user, model, rpm):
 
             txt = resp.text or "{}"
 
-            if "```json" in txt: txt = txt.split("```json")[1].split("```")[0].strip()
+            # Extract JSON from markdown code block if present
+            if "```json" in txt:
+                try:
+                    # Find the start of the JSON code block
+                    parts = txt.split("```json", 1)
+                    if len(parts) > 1:
+                        # Try to find the closing backticks
+                        json_parts = parts[1].split("```", 1)
+                        if len(json_parts) > 0:
+                            txt = json_parts[0].strip()
+                except (IndexError, ValueError, AttributeError):
+                    # If extraction fails, use the original text
+                    pass
 
             parsed = json.loads(txt)
 
