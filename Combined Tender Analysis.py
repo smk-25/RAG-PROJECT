@@ -1814,7 +1814,7 @@ OUTPUT FORMAT (strict JSON array):
 [
   {
     "ambiguous_text": "The exact text that is ambiguous or unclear",
-    "ambiguity_type": "One of: Vague Terms, Undefined Criteria, Conflicting Statements, Missing Information, Subjective Language, Other",
+    "ambiguity_type": "One of: Vague Terms, Unclear Requirements, Conflicting Statements, Undefined Terms, Missing Information, Subjective Language",
     "issue": "Clear explanation of what makes this ambiguous",
     "potential_impact": "How this ambiguity could affect compliance or interpretation",
     "severity": "One of: High, Medium, Low",
