@@ -1796,6 +1796,70 @@ OUTPUT FORMAT (strict JSON):
 
         return (map_system, map_instruction, reduce_system, reduce_instruction)
 
+    elif mode == "Ambiguity Scrutiny":
+
+        map_system = """You are analyzing tender documents to identify ambiguous, vague, or unclear language that could lead to misinterpretation."""
+        
+        map_instruction = """Extract ALL instances of ambiguity, vagueness, or unclear language from the document chunk.
+
+AMBIGUITY IDENTIFICATION:
+1. Look for vague terms (e.g., "reasonable", "appropriate", "timely", "sufficient" without clear definitions)
+2. Identify unclear requirements or conditions that lack specific criteria
+3. Flag conflicting or contradictory statements
+4. Note undefined terms or acronyms used without explanation
+5. Highlight incomplete information or missing details
+6. Identify subjective language without objective measures
+
+OUTPUT FORMAT (strict JSON array):
+[
+  {
+    "ambiguous_text": "The exact text that is ambiguous or unclear",
+    "ambiguity_type": "One of: Vague Terms, Unclear Requirements, Conflicting Statements, Undefined Terms, Missing Information, Subjective Language",
+    "issue": "Clear explanation of what makes this ambiguous",
+    "potential_impact": "How this ambiguity could affect compliance or interpretation",
+    "severity": "One of: High, Medium, Low",
+    "page": 1
+  }
+]
+
+If no ambiguities found in this chunk, return: []"""
+        
+        reduce_system = """You are consolidating ambiguity findings from multiple document chunks into a comprehensive report."""
+        
+        reduce_instruction = """Merge all identified ambiguities into a comprehensive scrutiny report.
+
+CONSOLIDATION RULES:
+1. Remove duplicate ambiguities (same issue appearing multiple times)
+2. Merge similar ambiguities with all page references
+3. Prioritize by severity (High > Medium > Low)
+4. Group by ambiguity type for systematic review
+5. Provide actionable recommendations for each ambiguity
+
+OUTPUT FORMAT (strict JSON):
+{
+  "ambiguities": [
+    {
+      "ambiguous_text": "The ambiguous text",
+      "ambiguity_type": "...",
+      "issue": "Explanation of the ambiguity",
+      "potential_impact": "Impact description",
+      "severity": "...",
+      "pages": [1, 5, 12],
+      "recommendation": "Suggested clarification or action"
+    }
+  ],
+  "summary": {
+    "total_ambiguities": 0,
+    "high_severity": 0,
+    "medium_severity": 0,
+    "low_severity": 0,
+    "by_type": {}
+  },
+  "overall_assessment": "Brief assessment of the document's clarity and potential risks from ambiguities"
+}"""
+
+        return (map_system, map_instruction, reduce_system, reduce_instruction)
+
     else:  # General Summary
 
         map_system = """You are extracting key information and findings from tender documents."""
@@ -2388,7 +2452,7 @@ else:
 
         gem_key = st.text_input("Google API Key", type="password", key="gka")
 
-        s_obj = st.radio("Objective", ["General Summary", "Compliance Matrix", "Risk Assessment", "Entity Dashboard"], key="sob")
+        s_obj = st.radio("Objective", ["General Summary", "Compliance Matrix", "Risk Assessment", "Entity Dashboard", "Ambiguity Scrutiny"], key="sob")
 
         s_model = st.text_input("Model", value="gemini-2.5-flash", key="smk")
 
