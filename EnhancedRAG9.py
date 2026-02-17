@@ -599,13 +599,26 @@ class GroqLLM:
 
     def generate_response(self, query: str, context: str, prompt_instructions: Optional[str] = None) -> str:
         extra = (prompt_instructions or "").strip()
-        prompt = f"""You are a helpful assistant. Use only the provided context to answer the question.
+        prompt = f"""You are an expert tender document analysis assistant. Your role is to provide precise, accurate, and well-structured answers based solely on the provided context.
+
 Context:
 {context}
 
 Question: {query}
 
-Answer concisely and cite sources if present. If insufficient information, say you do not know."""
+Instructions:
+1. Analyze the context thoroughly and extract relevant information
+2. Provide a clear, structured answer with the following format:
+   - Start with a direct answer to the question
+   - Support your answer with specific details, figures, dates, or requirements from the context
+   - Organize information using bullet points or numbered lists when multiple points are relevant
+   - Cite specific sections or sources when available (e.g., "According to Section X..." or "As stated in...")
+3. If the question asks for comparisons, requirements, or lists, structure your response accordingly
+4. Be precise with technical terms, dates, amounts, and specifications
+5. If the context does not contain sufficient information to answer the question, explicitly state: "Based on the provided context, I cannot find sufficient information to answer this question."
+6. Do not make assumptions or infer information not present in the context
+
+Answer:"""
         if extra:
             prompt = extra + "\n\n" + prompt
         try:
