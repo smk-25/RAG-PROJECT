@@ -1505,6 +1505,39 @@ GLOBAL_SUM_CONCURRENCY = asyncio.Semaphore(2)
 
 
 
+def clean_json_string(txt):
+    """Clean and fix common JSON formatting issues."""
+    
+    # Remove any leading/trailing whitespace
+    txt = txt.strip()
+    
+    # Extract JSON from markdown code block if present
+    if "```json" in txt:
+        try:
+            parts = txt.split("```json", 1)
+            if len(parts) > 1:
+                json_parts = parts[1].split("```", 1)
+                if len(json_parts) > 0:
+                    txt = json_parts[0].strip()
+        except (IndexError, ValueError, AttributeError):
+            pass
+    
+    # Remove any "```" markers that might remain
+    txt = txt.replace("```", "").strip()
+    
+    # Try to fix common JSON issues
+    # 1. Replace single quotes with double quotes for keys and values
+    # Using a more inclusive pattern to match keys with hyphens, spaces, etc.
+    # Pattern: 'key': 'value' -> "key": "value"
+    txt = re.sub(r"'([^']+)'(\s*:\s*)'([^']*)'", r'"\1"\2"\3"', txt)
+    txt = re.sub(r"'([^']+)'(\s*:\s*)", r'"\1"\2', txt)  # 'key': -> "key":
+    
+    # 2. Remove trailing commas before } or ]
+    txt = re.sub(r',(\s*[}\]])', r'\1', txt)
+    
+    return txt
+
+
 async def call_gemini_json_sum_async(client, sys, user, model, rpm):
 
     await asyncio.sleep(DEFAULT_RATE_LIMIT_SLEEP / max(1, rpm))  # Proper rate limiting
@@ -1519,27 +1552,24 @@ async def call_gemini_json_sum_async(client, sys, user, model, rpm):
 
             txt = resp.text or "{}"
 
-            # Extract JSON from markdown code block if present
-            if "```json" in txt:
+            # Clean the JSON string
+            txt = clean_json_string(txt)
+
+            # First attempt: parse as-is
+            try:
+                parsed = json.loads(txt)
+                return parsed
+            except json.JSONDecodeError:
+                # Second attempt: try replacing all single quotes with double quotes
+                # WARNING: This is aggressive and will break valid strings with apostrophes
+                # (e.g., "it's" becomes "it"s"). This is a known limitation.
+                txt_fixed = txt.replace("'", '"')
                 try:
-                    # Find the start of the JSON code block
-                    parts = txt.split("```json", 1)
-                    if len(parts) > 1:
-                        # Try to find the closing backticks
-                        json_parts = parts[1].split("```", 1)
-                        if len(json_parts) > 0:
-                            txt = json_parts[0].strip()
-                except (IndexError, ValueError, AttributeError):
-                    # If extraction fails, use the original text
-                    pass
-
-            parsed = json.loads(txt)
-
-            return parsed
-
-        except json.JSONDecodeError as e:
-
-            return {"error": f"Invalid JSON response: {str(e)}"}
+                    parsed = json.loads(txt_fixed)
+                    return parsed
+                except json.JSONDecodeError as e:
+                    # If it still fails, return the error
+                    return {"error": f"Invalid JSON response: {str(e)}"}
 
         except Exception as e:
 
