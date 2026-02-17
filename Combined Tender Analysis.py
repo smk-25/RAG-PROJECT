@@ -940,7 +940,24 @@ class GroqLLMRAG:
 
         # Note: Citation logic is handled separately by dedicated citation functions
 
-        p = f"{prompt_instr}\n\nContext:\n{ctx}\n\nQuestion: {q}\n\nProvide a clear and concise answer based on the context provided."
+        p = f"""{prompt_instr}
+
+TASK: Answer the user's question using ONLY the provided context.
+
+CONTEXT:
+{ctx}
+
+QUESTION: {q}
+
+INSTRUCTIONS:
+1. Answer must be based exclusively on the context above
+2. If the context doesn't contain relevant information, respond: "The provided context does not contain sufficient information to answer this question."
+3. Use clear, professional language with short paragraphs
+4. Each statement must be traceable to the context
+5. Provide specific details from the context when available (e.g., dates, numbers, requirements)
+6. Output format: Plain text response with NO markdown or special formatting unless present in original context
+
+ANSWER:"""
 
         return self.llm.invoke([HumanMessage(content=p)]).content
 
@@ -952,27 +969,33 @@ class GroqLLMRAG:
 
         try:
 
-            prompt = f"""Given this question: "{q}"
+            prompt = f"""Generate {MAX_QUERY_VARIATIONS} alternative phrasings of the following question for better document retrieval.
 
+ORIGINAL QUESTION: "{q}"
 
+REQUIREMENTS:
+1. Each variation must preserve the core intent but use different vocabulary and phrasing
+2. Vary sentence structure (e.g., interrogative, declarative, keyword-based forms)
+3. Ensure semantic diversity - each should potentially match different document sections
+4. Focus on different aspects or perspectives of the same question
+5. Avoid overly generic or broad alternatives
+6. Keep variations concise and focused
 
-Generate {MAX_QUERY_VARIATIONS} alternative phrasings that capture the same intent but use different words. 
+OUTPUT FORMAT:
+Respond with ONLY the alternative questions, one per line, without numbering, bullets, or explanations.
+Do NOT include the original question in your response.
 
-These will be used for document retrieval.
-
-
-
-Respond with only the alternative questions, one per line, without any numbering, bullets, or explanation."""
+VARIATIONS:"""
 
 
 
             response = self.llm.invoke([HumanMessage(content=prompt)]).content
 
-            # Filter out lines that look like numbered/bulleted lists
+            # Filter out lines that look like numbered/bulleted lists or are too short
 
             variations = [line.strip() for line in response.strip().split('\n') 
 
-                         if line.strip() and not re.match(r'^[\d\w][\.\)\:]', line.strip())]
+                         if line.strip() and len(line.strip()) > 5 and not re.match(r'^[\d\w][\.\)\:]', line.strip())]
 
 
 
@@ -994,19 +1017,29 @@ Respond with only the alternative questions, one per line, without any numbering
 
         try:
 
-            prompt = f"""Question: {q}
+            prompt = f"""Validate if the answer is accurately grounded in the provided context.
 
+QUESTION: {q}
 
+PROVIDED ANSWER: {answer}
 
-Answer: {answer}
+SOURCE CONTEXT: {context[:ANSWER_VALIDATION_CONTEXT_CHARS]}
 
+VALIDATION CRITERIA:
+1. Check if every factual claim in the answer is supported by the context
+2. Identify any statements made without clear context support
+3. Flag if the answer adds interpretation or inference beyond what's stated in context
+4. Verify that the answer doesn't contradict any information in the context
+5. Assess if critical context information is missing from the answer
 
+RESPONSE FORMAT:
+Start with 'YES' if the answer is well-grounded, or 'NO' if it has significant issues.
+Then provide a brief explanation covering:
+- What parts are well-supported
+- Any unsupported claims or issues found
+- Overall assessment
 
-Context: {context[:ANSWER_VALIDATION_CONTEXT_CHARS]}
-
-
-
-Does the answer accurately reflect information from the context? Respond with only 'YES' or 'NO' followed by a brief explanation."""
+VALIDATION:"""
 
 
 
@@ -1584,19 +1617,237 @@ def get_sum_prompts(mode: str):
 
     if mode == "Compliance Matrix":
 
-        return ("Extract requirements.", "JSON: [{\"item\": \"...\", \"detail\": \"...\", \"page\": 1}]", "Merge matrix.", "JSON: {\"matrix\": [...]}")
+        map_system = """You are a compliance requirements extractor analyzing tender documents. Extract specific, actionable requirements."""
+        
+        map_instruction = """Extract ALL compliance requirements, obligations, and conditions from the document chunk.
+
+EXTRACTION RULES:
+1. Identify explicit requirements (must/shall/required statements)
+2. Include implicit requirements (should/recommended items)
+3. Capture specific criteria (thresholds, dates, qualifications)
+4. Note any conditional requirements (if-then clauses)
+5. Reference the page number where each requirement appears
+
+OUTPUT FORMAT (strict JSON array):
+[
+  {
+    "item": "Brief requirement title",
+    "detail": "Complete requirement description with specific criteria",
+    "category": "Financial|Technical|Legal|Insurance|Operational|Other",
+    "mandatory": true/false,
+    "page": 1
+  }
+]
+
+If no requirements found in this chunk, return: []"""
+        
+        reduce_system = """You are consolidating compliance requirements from multiple document chunks into a unified matrix."""
+        
+        reduce_instruction = """Merge all extracted requirements into a comprehensive compliance matrix.
+
+CONSOLIDATION RULES:
+1. Remove exact duplicates (same requirement appearing multiple times)
+2. Merge similar requirements with all page references
+3. Group by category for better organization
+4. Preserve all unique mandatory vs optional distinctions
+5. Maintain complete detail for each requirement
+
+OUTPUT FORMAT (strict JSON):
+{
+  "matrix": [
+    {
+      "item": "Requirement title",
+      "detail": "Full description",
+      "category": "...",
+      "mandatory": true/false,
+      "pages": [1, 5, 12]
+    }
+  ],
+  "total_requirements": 0,
+  "summary": {
+    "mandatory_count": 0,
+    "optional_count": 0,
+    "categories": {}
+  }
+}"""
+
+        return (map_system, map_instruction, reduce_system, reduce_instruction)
 
     elif mode == "Risk Assessment":
 
-        return ("Flag risks.", "JSON: [{\"clause\": \"...\", \"risk_level\": \"...\", \"page\": 1}]", "Merge risks.", "JSON: {\"risks\": [...]}")
+        map_system = """You are a risk analyst identifying risks, liabilities, and concerns in tender documents."""
+        
+        map_instruction = """Extract ALL identified or potential risks from the document chunk.
+
+RISK IDENTIFICATION:
+1. Look for explicit risk mentions (penalties, liabilities, constraints)
+2. Identify implicit risks (tight deadlines, complex requirements, ambiguous terms)
+3. Note financial risks (payment terms, penalties, insurance requirements)
+4. Flag operational risks (resource constraints, dependencies)
+5. Include legal/compliance risks (regulatory requirements, liability clauses)
+
+OUTPUT FORMAT (strict JSON array):
+[
+  {
+    "clause": "Brief description of the risky clause or requirement",
+    "risk_level": "Critical|High|Medium|Low",
+    "risk_type": "Financial|Operational|Legal|Reputational|Technical",
+    "impact": "Description of potential impact",
+    "page": 1
+  }
+]
+
+If no risks identified, return: []"""
+        
+        reduce_system = """You are consolidating risk assessments from multiple document chunks."""
+        
+        reduce_instruction = """Merge all identified risks into a comprehensive risk assessment.
+
+CONSOLIDATION RULES:
+1. Remove duplicate risk entries
+2. Merge related risks with all page references
+3. Prioritize by risk level (Critical > High > Medium > Low)
+4. Group by risk type for strategic overview
+5. Provide risk distribution statistics
+
+OUTPUT FORMAT (strict JSON):
+{
+  "risks": [
+    {
+      "clause": "Risk description",
+      "risk_level": "...",
+      "risk_type": "...",
+      "impact": "...",
+      "pages": [2, 8, 15]
+    }
+  ],
+  "risk_summary": {
+    "total_risks": 0,
+    "critical_count": 0,
+    "high_count": 0,
+    "medium_count": 0,
+    "low_count": 0,
+    "by_type": {}
+  }
+}"""
+
+        return (map_system, map_instruction, reduce_system, reduce_instruction)
 
     elif mode == "Entity Dashboard":
 
-        return ("Extract metadata.", "JSON: [{\"category\": \"...\", \"entity\": \"...\", \"page\": 1}]", "Compile Dashboard.", "JSON: {\"dashboard\": {}}")
+        map_system = """You are extracting key entities and metadata from tender documents."""
+        
+        map_instruction = """Extract ALL named entities and important metadata from the document chunk.
 
-    else:
+ENTITY CATEGORIES:
+1. Organizations: Companies, agencies, departments
+2. People: Key contacts, decision-makers
+3. Locations: Addresses, sites, regions
+4. Dates: Deadlines, milestones, timeframes
+5. Financial: Budgets, amounts, payment terms
+6. Technical: Systems, standards, specifications
 
-        return ("Extract details.", "JSON: [{\"finding\": \"...\", \"page\": 1}]", "Synthesize summary.", "JSON: {\"summary\": \"...\", \"citations\": [pages]}")
+OUTPUT FORMAT (strict JSON array):
+[
+  {
+    "category": "Organization|Person|Location|Date|Financial|Technical",
+    "entity": "The specific entity name or value",
+    "context": "Brief context about relevance",
+    "page": 1
+  }
+]
+
+If no entities found, return: []"""
+        
+        reduce_system = """You are compiling entities into an organized dashboard."""
+        
+        reduce_instruction = """Consolidate all entities into a structured dashboard.
+
+COMPILATION RULES:
+1. Group entities by category
+2. Remove duplicate entities (keep all page references)
+3. Organize chronologically for dates
+4. Prioritize high-value/critical entities
+5. Create summary statistics
+
+OUTPUT FORMAT (strict JSON):
+{
+  "dashboard": {
+    "Organizations": [],
+    "People": [],
+    "Locations": [],
+    "Dates": [],
+    "Financial": [],
+    "Technical": []
+  },
+  "entity_count": {
+    "Organizations": 0,
+    "People": 0,
+    "Locations": 0,
+    "Dates": 0,
+    "Financial": 0,
+    "Technical": 0
+  }
+}"""
+
+        return (map_system, map_instruction, reduce_system, reduce_instruction)
+
+    else:  # General Summary
+
+        map_system = """You are extracting key information and findings from tender documents."""
+        
+        map_instruction = """Extract important findings, details, and insights from the document chunk.
+
+EXTRACTION FOCUS:
+1. Main topics and themes covered
+2. Critical requirements or obligations
+3. Important facts, figures, and data points
+4. Notable conditions or constraints
+5. Any unique or unusual provisions
+
+OUTPUT FORMAT (strict JSON array):
+[
+  {
+    "finding": "Clear, concise description of the finding",
+    "type": "Requirement|Condition|Fact|Constraint|Opportunity",
+    "importance": "High|Medium|Low",
+    "page": 1
+  }
+]
+
+If chunk contains no significant information, return: []"""
+        
+        reduce_system = """You are synthesizing findings into a comprehensive summary."""
+        
+        reduce_instruction = """Create a well-structured summary from all extracted findings.
+
+SYNTHESIS RULES:
+1. Organize findings by type and importance
+2. Create a coherent narrative summary
+3. Highlight high-importance items
+4. Include all relevant page citations
+5. Provide statistics on findings
+
+OUTPUT FORMAT (strict JSON):
+{
+  "summary": "Comprehensive 2-3 paragraph summary of key findings",
+  "key_findings": [
+    {
+      "finding": "...",
+      "type": "...",
+      "importance": "...",
+      "pages": [1, 3, 7]
+    }
+  ],
+  "citations": [1, 2, 3, 5, 7],
+  "finding_stats": {
+    "total_findings": 0,
+    "high_importance": 0,
+    "by_type": {}
+  }
+}"""
+
+        return (map_system, map_instruction, reduce_system, reduce_instruction)
 
 
 
