@@ -1529,7 +1529,7 @@ async def call_gemini_json_sum_async(client, sys, user, model, rpm):
                         json_parts = parts[1].split("```", 1)
                         if len(json_parts) > 0:
                             txt = json_parts[0].strip()
-                except Exception:
+                except (IndexError, ValueError, AttributeError):
                     # If extraction fails, use the original text
                     pass
 
