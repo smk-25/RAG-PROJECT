@@ -20,4 +20,5 @@ PyPDF2
 nltk
 numpy
 pandas
+tabulate
 google-genai
