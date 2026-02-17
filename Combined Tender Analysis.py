@@ -1507,7 +1507,6 @@ GLOBAL_SUM_CONCURRENCY = asyncio.Semaphore(2)
 
 def clean_json_string(txt):
     """Clean and fix common JSON formatting issues."""
-    import re
     
     # Remove any leading/trailing whitespace
     txt = txt.strip()
@@ -1527,18 +1526,14 @@ def clean_json_string(txt):
     txt = txt.replace("```", "").strip()
     
     # Try to fix common JSON issues
-    # 1. Replace single quotes with double quotes (but be careful with apostrophes in strings)
-    # This is a simple heuristic - replace single quotes around keys and string values
+    # 1. Replace single quotes with double quotes for keys and values
+    # Using a more inclusive pattern to match keys with hyphens, spaces, etc.
     # Pattern: 'key': 'value' -> "key": "value"
-    txt = re.sub(r"'(\w+)'(\s*:\s*)'([^']*)'", r'"\1"\2"\3"', txt)
-    txt = re.sub(r"'(\w+)'(\s*:\s*)", r'"\1"\2', txt)  # 'key': -> "key":
+    txt = re.sub(r"'([^']+)'(\s*:\s*)'([^']*)'", r'"\1"\2"\3"', txt)
+    txt = re.sub(r"'([^']+)'(\s*:\s*)", r'"\1"\2', txt)  # 'key': -> "key":
     
     # 2. Remove trailing commas before } or ]
     txt = re.sub(r',(\s*[}\]])', r'\1', txt)
-    
-    # 3. Handle single quotes that might remain (for string values)
-    # Replace remaining single quotes with double quotes, but this is risky
-    # Only do this if the JSON still fails to parse
     
     return txt
 
@@ -1566,7 +1561,8 @@ async def call_gemini_json_sum_async(client, sys, user, model, rpm):
                 return parsed
             except json.JSONDecodeError:
                 # Second attempt: try replacing all single quotes with double quotes
-                # This is more aggressive and might break valid strings with apostrophes
+                # WARNING: This is aggressive and will break valid strings with apostrophes
+                # (e.g., "it's" becomes "it"s"). This is a known limitation.
                 txt_fixed = txt.replace("'", '"')
                 try:
                     parsed = json.loads(txt_fixed)
@@ -1574,10 +1570,6 @@ async def call_gemini_json_sum_async(client, sys, user, model, rpm):
                 except json.JSONDecodeError as e:
                     # If it still fails, return the error
                     return {"error": f"Invalid JSON response: {str(e)}"}
-
-        except json.JSONDecodeError as e:
-
-            return {"error": f"Invalid JSON response: {str(e)}"}
 
         except Exception as e:
 
