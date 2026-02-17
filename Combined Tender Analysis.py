@@ -1971,6 +1971,49 @@ def compute_confidence_score_sum(mapped, reduced, q):
 
 
 
+def render_page_level_citations_sum(chunks, pages):
+    """Display page-level citation tracking with text snippets from chunks"""
+    
+    if not chunks or not pages:
+        return
+    
+    st.markdown("---")
+    with st.expander("📋 Citation Tracking: Page-Level Extraction", expanded=True):
+        st.markdown("**Source pages and text excerpts that informed this analysis:**")
+        
+        # Group chunks by page
+        page_chunks = {}
+        for chunk in chunks:
+            page = chunk.get('start_page', 0)
+            if page in pages:
+                if page not in page_chunks:
+                    page_chunks[page] = []
+                page_chunks[page].append(chunk)
+        
+        # Display citations for each page
+        for page_num in sorted(page_chunks.keys()):
+            st.markdown(f"#### 📄 Page {page_num}")
+            
+            for idx, chunk in enumerate(page_chunks[page_num]):
+                text = chunk.get('text', '')
+                chunk_id = chunk.get('id', 'N/A')
+                
+                # Truncate text for display
+                display_text = text
+                if len(display_text) > MAX_CLAUSE_DISPLAY_LENGTH:
+                    display_text = display_text[:MAX_CLAUSE_DISPLAY_LENGTH] + "..."
+                
+                st.markdown(f"**Citation {idx + 1}** (Chunk ID: `{chunk_id}`)")
+                st.text(display_text)
+                
+                # Show full text in a nested expander if truncated
+                if len(text) > MAX_CLAUSE_DISPLAY_LENGTH:
+                    with st.expander(f"Show full text for citation {idx + 1}"):
+                        st.text(text)
+            
+            st.markdown("---")
+
+
 def render_citation_preview_sum(doc, cites):
 
     if not cites or not doc: 
@@ -1997,6 +2040,135 @@ def render_citation_preview_sum(doc, cites):
 
                 st.error(f"Failed to load page {c['page']}: {e}")
 
+
+
+def _format_pages_column(df):
+    """Helper function to convert pages list to string for better display"""
+    if "pages" in df.columns:
+        df["pages"] = df["pages"].apply(lambda x: ", ".join(map(str, x)) if isinstance(x, list) else str(x))
+    return df
+
+
+def sanitize_filename(text, max_length=30):
+    """Sanitize text for use in filenames by removing invalid characters"""
+    # Remove or replace invalid filename characters
+    invalid_chars = '<>:"/\\|?*'
+    for char in invalid_chars:
+        text = text.replace(char, '_')
+    # Limit length and strip whitespace
+    return text[:max_length].strip().replace(' ', '_')
+
+
+def convert_result_to_dataframe(result, objective):
+    """Convert summarization result JSON to pandas DataFrame based on objective type"""
+    
+    if not isinstance(result, dict):
+        return None
+    
+    try:
+        df = None
+        
+        if objective == "Compliance Matrix" and "matrix" in result:
+            df = pd.DataFrame(result["matrix"])
+        
+        elif objective == "Risk Assessment" and "risks" in result:
+            df = pd.DataFrame(result["risks"])
+        
+        elif objective == "Entity Dashboard" and "entities" in result:
+            df = pd.DataFrame(result["entities"])
+        
+        elif objective == "Ambiguity Scrutiny" and "ambiguities" in result:
+            df = pd.DataFrame(result["ambiguities"])
+        
+        elif objective == "General Summary":
+            # For general summary, try to extract any list data
+            for key in result.keys():
+                if isinstance(result[key], list) and result[key]:
+                    df = pd.DataFrame(result[key])
+                    break
+        
+        # Format pages column if DataFrame was created
+        if df is not None:
+            df = _format_pages_column(df)
+        
+        return df
+    except Exception as e:
+        st.warning(f"Could not convert result to table: {e}")
+        return None
+
+
+def export_to_excel(df, query, objective):
+    """Export DataFrame to Excel file and return bytes"""
+    
+    if df is None or df.empty:
+        return None
+    
+    try:
+        from io import BytesIO
+        output = BytesIO()
+        
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df.to_excel(writer, index=False, sheet_name='Results')
+            
+            # Get the worksheet
+            worksheet = writer.sheets['Results']
+            
+            # Auto-adjust column widths
+            for column in worksheet.columns:
+                max_length = 0
+                column = [cell for cell in column]
+                for cell in column:
+                    try:
+                        if len(str(cell.value)) > max_length:
+                            max_length = len(str(cell.value))
+                    except (TypeError, AttributeError):
+                        pass
+                adjusted_width = min(max_length + 2, 50)
+                worksheet.column_dimensions[column[0].column_letter].width = adjusted_width
+        
+        output.seek(0)
+        return output.getvalue()
+    except Exception as e:
+        st.error(f"Error creating Excel file: {e}")
+        return None
+
+
+def export_to_word(df, query, objective):
+    """Export DataFrame to Word document and return bytes"""
+    
+    if df is None or df.empty:
+        return None
+    
+    try:
+        from io import BytesIO
+        output = BytesIO()
+        
+        doc = Document()
+        doc.add_heading(f'{objective} - Results', 0)
+        doc.add_paragraph(f'Query: {query}')
+        doc.add_paragraph('')
+        
+        # Add table
+        table = doc.add_table(rows=1, cols=len(df.columns))
+        table.style = 'Light Grid Accent 1'
+        
+        # Add header row
+        header_cells = table.rows[0].cells
+        for i, column_name in enumerate(df.columns):
+            header_cells[i].text = str(column_name)
+        
+        # Add data rows
+        for _, row in df.iterrows():
+            row_cells = table.add_row().cells
+            for i, value in enumerate(row):
+                row_cells[i].text = str(value) if value is not None else ''
+        
+        doc.save(output)
+        output.seek(0)
+        return output.getvalue()
+    except Exception as e:
+        st.error(f"Error creating Word document: {e}")
+        return None
 
 
 # --------------------------
@@ -2685,6 +2857,44 @@ else:
             st.info(f"Confidence: {conf['overall_confidence']:.2%}")
 
 
+            
+            # Convert results to table format and display
+            df = convert_result_to_dataframe(r["result"], s_obj)
+            
+            if df is not None and not df.empty:
+                st.markdown("---")
+                st.markdown("### 📊 Results Table")
+                st.dataframe(df, use_container_width=True)
+                
+                # Export buttons
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    excel_data = export_to_excel(df, r['query'], s_obj)
+                    if excel_data:
+                        safe_objective = sanitize_filename(s_obj)
+                        safe_query = sanitize_filename(r['query'])
+                        st.download_button(
+                            label="📥 Download Excel",
+                            data=excel_data,
+                            file_name=f"{safe_objective}_{safe_query}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            key=f"excel_{r['query']}"
+                        )
+                
+                with col2:
+                    word_data = export_to_word(df, r['query'], s_obj)
+                    if word_data:
+                        safe_objective = sanitize_filename(s_obj)
+                        safe_query = sanitize_filename(r['query'])
+                        st.download_button(
+                            label="📥 Download Word",
+                            data=word_data,
+                            file_name=f"{safe_objective}_{safe_query}.docx",
+                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                            key=f"word_{r['query']}"
+                        )
+
 
             # Find pages for preview
 
@@ -2722,6 +2932,11 @@ else:
 
             _f(r['result'])
 
+
+
+            # Display page-level citation tracking with text excerpts
+            if pgs:
+                render_page_level_citations_sum(chunks, sorted(set(pgs)))
 
 
             if pgs and f_sum:
