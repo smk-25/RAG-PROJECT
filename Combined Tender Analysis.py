@@ -995,7 +995,7 @@ VARIATIONS:"""
 
             variations = [line.strip() for line in response.strip().split('\n') 
 
-                         if line.strip() and len(line.strip()) > 5 and not re.match(r'^[\d\w][\.\)\:]', line.strip())]
+                         if line.strip() and len(line.strip()) > 3 and not re.match(r'^[\d\w][\.\)\:]', line.strip())]
 
 
 
@@ -1633,7 +1633,7 @@ OUTPUT FORMAT (strict JSON array):
   {
     "item": "Brief requirement title",
     "detail": "Complete requirement description with specific criteria",
-    "category": "Financial|Technical|Legal|Insurance|Operational|Other",
+    "category": "One of: Financial, Technical, Legal, Insurance, Operational, Other",
     "mandatory": true/false,
     "page": 1
   }
@@ -1690,8 +1690,8 @@ OUTPUT FORMAT (strict JSON array):
 [
   {
     "clause": "Brief description of the risky clause or requirement",
-    "risk_level": "Critical|High|Medium|Low",
-    "risk_type": "Financial|Operational|Legal|Reputational|Technical",
+    "risk_level": "One of: Critical, High, Medium, Low",
+    "risk_type": "One of: Financial, Operational, Legal, Reputational, Technical",
     "impact": "Description of potential impact",
     "page": 1
   }
@@ -1750,7 +1750,7 @@ ENTITY CATEGORIES:
 OUTPUT FORMAT (strict JSON array):
 [
   {
-    "category": "Organization|Person|Location|Date|Financial|Technical",
+    "category": "One of: Organization, Person, Location, Date, Financial, Technical",
     "entity": "The specific entity name or value",
     "context": "Brief context about relevance",
     "page": 1
@@ -1809,8 +1809,8 @@ OUTPUT FORMAT (strict JSON array):
 [
   {
     "finding": "Clear, concise description of the finding",
-    "type": "Requirement|Condition|Fact|Constraint|Opportunity",
-    "importance": "High|Medium|Low",
+    "type": "One of: Requirement, Condition, Fact, Constraint, Opportunity",
+    "importance": "One of: High, Medium, Low",
     "page": 1
   }
 ]
