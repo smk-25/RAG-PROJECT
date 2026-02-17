@@ -254,7 +254,6 @@ def chunk_hybrid_token_semantic(docs: List[Document], chunk_size: int = 800, chu
                 
                 # Start new chunk with overlap
                 # Keep last few sentences for overlap
-                overlap_text = " ".join(current_chunk)
                 overlap_sentences = []
                 overlap_length = 0
                 
@@ -266,7 +265,7 @@ def chunk_hybrid_token_semantic(docs: List[Document], chunk_size: int = 800, chu
                         break
                 
                 current_chunk = overlap_sentences + [sentence]
-                current_length = sum(len(s) for s in current_chunk)
+                current_length = overlap_length + sentence_length
             else:
                 current_chunk.append(sentence)
                 current_length += sentence_length
