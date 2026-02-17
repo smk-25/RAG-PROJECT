@@ -926,6 +926,9 @@ if choice == "Simple QA (RAG)":
                 st.stop()
             
             with st.spinner("Thinking..."):
+                # Start total time measurement
+                total_start_time = time.time()
+                
                 # Cache cross-encoder model in session state
                 if u_crs and CROSS_ENCODER_AVAILABLE:
                     if "cross_encoder" not in st.session_state:
@@ -939,6 +942,9 @@ if choice == "Simple QA (RAG)":
                 # Initialize LLM and retriever
                 llm = GroqLLMRAG(key=ga_key)
                 ret = RAGRetrieverRAG(st.session_state["rvs"], st.session_state["sem"], cr, sparse=st.session_state.get("rbm"), use_s=u_spa)
+                
+                # Start retrieval time measurement
+                retrieval_start_time = time.time()
                 
                 # Query expansion if enabled
                 if use_query_expansion:
@@ -956,6 +962,9 @@ if choice == "Simple QA (RAG)":
                     # Standard retrieval
                     res = ret.retrieve(q, top_k)
                 
+                # End retrieval time measurement
+                retrieval_time = time.time() - retrieval_start_time
+                
                 if not res:
                     st.warning("No relevant documents found for your query. Try rephrasing or check if documents are properly indexed.")
                     st.stop()
@@ -972,9 +981,18 @@ if choice == "Simple QA (RAG)":
                         st.text(content)
                         st.markdown("---")
                 
+                # Start generation time measurement
+                generation_start_time = time.time()
+                
                 # Generate answer
                 ctx, used = assemble_context_rag(res, max_ctx=max_tk)
                 ans = llm.generate_response(q, ctx)
+                
+                # End generation time measurement
+                generation_time = time.time() - generation_start_time
+                
+                # Calculate total time
+                total_time = time.time() - total_start_time
                 
                 # Answer validation if enabled
                 if use_answer_validation:
@@ -986,6 +1004,17 @@ if choice == "Simple QA (RAG)":
                 # Display answer
                 st.subheader("Answer")
                 st.write(strip_provenance(ans))
+                
+                # Display timing metrics
+                st.markdown("---")
+                st.subheader("⏱️ Performance Metrics")
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Retrieval Time", f"{retrieval_time:.2f} sec")
+                with col2:
+                    st.metric("Generation Time", f"{generation_time:.2f} sec")
+                with col3:
+                    st.metric("Total Time", f"{total_time:.2f} sec")
                 
                 # Confidence score
                 supp = compute_mean_support_score_shared(res)
