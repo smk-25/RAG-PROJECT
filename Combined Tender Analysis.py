@@ -1971,6 +1971,49 @@ def compute_confidence_score_sum(mapped, reduced, q):
 
 
 
+def render_page_level_citations_sum(chunks, pages):
+    """Display page-level citation tracking with text snippets from chunks"""
+    
+    if not chunks or not pages:
+        return
+    
+    st.markdown("---")
+    with st.expander("📋 Citation Tracking: Page-Level Extraction", expanded=True):
+        st.markdown("**Source pages and text excerpts that informed this analysis:**")
+        
+        # Group chunks by page
+        page_chunks = {}
+        for chunk in chunks:
+            page = chunk.get('start_page', 0)
+            if page in pages:
+                if page not in page_chunks:
+                    page_chunks[page] = []
+                page_chunks[page].append(chunk)
+        
+        # Display citations for each page
+        for page_num in sorted(page_chunks.keys()):
+            st.markdown(f"#### 📄 Page {page_num}")
+            
+            for idx, chunk in enumerate(page_chunks[page_num]):
+                text = chunk.get('text', '')
+                chunk_id = chunk.get('id', 'N/A')
+                
+                # Truncate text for display
+                display_text = text
+                if len(display_text) > MAX_CLAUSE_DISPLAY_LENGTH:
+                    display_text = display_text[:MAX_CLAUSE_DISPLAY_LENGTH] + "..."
+                
+                st.markdown(f"**Citation {idx + 1}** (Chunk ID: `{chunk_id}`)")
+                st.text(display_text)
+                
+                # Show full text in a nested expander if truncated
+                if len(text) > MAX_CLAUSE_DISPLAY_LENGTH:
+                    with st.expander(f"Show full text for citation {idx + 1}"):
+                        st.text(text)
+            
+            st.markdown("---")
+
+
 def render_citation_preview_sum(doc, cites):
 
     if not cites or not doc: 
@@ -2722,6 +2765,11 @@ else:
 
             _f(r['result'])
 
+
+
+            # Display page-level citation tracking with text excerpts
+            if pgs:
+                render_page_level_citations_sum(chunks, sorted(set(pgs)))
 
 
             if pgs and f_sum:
