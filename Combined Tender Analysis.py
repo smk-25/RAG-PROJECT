@@ -44,13 +44,11 @@ except Exception:
     CROSS_ENCODER_AVAILABLE = False
 
 try:
-    from langchain_community.document_loaders import PyPDFLoader
-    from langchain.text_splitter import RecursiveCharacterTextSplitter
     from langchain_groq import ChatGroq
     from langchain.schema import HumanMessage
     LANGCHAIN_AVAILABLE = True
 except Exception:
-    PyPDFLoader = RecursiveCharacterTextSplitter = ChatGroq = HumanMessage = None
+    ChatGroq = HumanMessage = None
     LANGCHAIN_AVAILABLE = False
 
 try:
@@ -164,6 +162,157 @@ def compute_mean_support_score_shared(results: List[Dict[str, Any]]) -> float:
     if not results: return 0.0
     scores = [float(r.get("similarity_score", 0.0)) for r in results]
     return float(np.max(scores)) if scores else 0.0
+
+# --------------------------
+# PDF Loading with PyMuPDF
+# --------------------------
+class Document:
+    """Simple Document class to replace langchain Document"""
+    def __init__(self, page_content: str, metadata: dict = None):
+        self.page_content = page_content
+        self.metadata = metadata or {}
+
+def load_pdf_with_pymupdf(pdf_path: str) -> List[Document]:
+    """Load PDF using PyMuPDF (fitz) and return list of Documents"""
+    docs = []
+    try:
+        pdf_document = fitz.open(pdf_path)
+        for page_num in range(len(pdf_document)):
+            page = pdf_document[page_num]
+            text = page.get_text()
+            if text.strip():  # Only add pages with content
+                doc = Document(
+                    page_content=text,
+                    metadata={"page": page_num + 1}
+                )
+                docs.append(doc)
+        pdf_document.close()
+    except Exception as e:
+        st.error(f"Error loading PDF with PyMuPDF: {e}")
+    return docs
+
+# --------------------------
+# Chunking Methods
+# --------------------------
+def chunk_recursive_character(docs: List[Document], chunk_size: int = 800, chunk_overlap: int = 128) -> List[Document]:
+    """Recursive Character Text Splitter - splits by characters with overlap"""
+    chunks = []
+    
+    for doc in docs:
+        text = doc.page_content
+        metadata = doc.metadata.copy()
+        
+        # Split text into chunks
+        start = 0
+        while start < len(text):
+            end = start + chunk_size
+            chunk_text = text[start:end]
+            
+            if chunk_text.strip():
+                chunks.append(Document(
+                    page_content=chunk_text,
+                    metadata=metadata
+                ))
+            
+            start += chunk_size - chunk_overlap
+            if start >= len(text):
+                break
+    
+    return chunks
+
+def chunk_hybrid_token_semantic(docs: List[Document], chunk_size: int = 800, chunk_overlap: int = 128) -> List[Document]:
+    """Hybrid chunking combining token-based limits with semantic boundaries (sentences)"""
+    chunks = []
+    
+    for doc in docs:
+        text = doc.page_content
+        metadata = doc.metadata.copy()
+        
+        # Split into sentences
+        try:
+            if _NLTK_READY:
+                sentences = nltk.sent_tokenize(text)
+            else:
+                sentences = simple_sent_tokenize_shared(text)
+        except:
+            sentences = simple_sent_tokenize_shared(text)
+        
+        current_chunk = []
+        current_length = 0
+        
+        for sentence in sentences:
+            sentence_length = len(sentence)
+            
+            # If adding this sentence exceeds chunk_size, save current chunk
+            if current_length + sentence_length > chunk_size and current_chunk:
+                chunk_text = " ".join(current_chunk)
+                if chunk_text.strip():
+                    chunks.append(Document(
+                        page_content=chunk_text,
+                        metadata=metadata
+                    ))
+                
+                # Start new chunk with overlap
+                # Keep last few sentences for overlap
+                overlap_text = " ".join(current_chunk)
+                overlap_sentences = []
+                overlap_length = 0
+                
+                for s in reversed(current_chunk):
+                    if overlap_length + len(s) <= chunk_overlap:
+                        overlap_sentences.insert(0, s)
+                        overlap_length += len(s)
+                    else:
+                        break
+                
+                current_chunk = overlap_sentences + [sentence]
+                current_length = sum(len(s) for s in current_chunk)
+            else:
+                current_chunk.append(sentence)
+                current_length += sentence_length
+        
+        # Add remaining chunk
+        if current_chunk:
+            chunk_text = " ".join(current_chunk)
+            if chunk_text.strip():
+                chunks.append(Document(
+                    page_content=chunk_text,
+                    metadata=metadata
+                ))
+    
+    return chunks
+
+def chunk_fixed_context_window(docs: List[Document], window_size: int = 800) -> List[Document]:
+    """Fixed Context Window - splits text into fixed-size non-overlapping windows"""
+    chunks = []
+    
+    for doc in docs:
+        text = doc.page_content
+        metadata = doc.metadata.copy()
+        
+        # Split text into fixed windows
+        for i in range(0, len(text), window_size):
+            chunk_text = text[i:i + window_size]
+            
+            if chunk_text.strip():
+                chunks.append(Document(
+                    page_content=chunk_text,
+                    metadata=metadata
+                ))
+    
+    return chunks
+
+def apply_chunking_method(docs: List[Document], method: str, chunk_size: int = 800, chunk_overlap: int = 128) -> List[Document]:
+    """Apply selected chunking method to documents"""
+    if method == "Recursive Character Splitter":
+        return chunk_recursive_character(docs, chunk_size, chunk_overlap)
+    elif method == "Hybrid (Token+Semantic)":
+        return chunk_hybrid_token_semantic(docs, chunk_size, chunk_overlap)
+    elif method == "Fixed Context Window":
+        return chunk_fixed_context_window(docs, chunk_size)
+    else:
+        # Default to recursive character splitter
+        return chunk_recursive_character(docs, chunk_size, chunk_overlap)
 
 # --------------------------
 # RAG Components
@@ -685,6 +834,14 @@ if choice == "Simple QA (RAG)":
         crs_m = st.text_input("Cross-Encoder", "cross-encoder/ms-marco-MiniLM-L-6-v2", key="rcm")
         u_crs = st.checkbox("Use Cross-Encoder", True, key="rucx")
         u_spa = st.checkbox("Use Sparse BM25", True, key="rusp")
+        
+        # Chunking method selection
+        chunk_method = st.selectbox(
+            "Chunking Method",
+            ["Recursive Character Splitter", "Hybrid (Token+Semantic)", "Fixed Context Window"],
+            key="chunk_method"
+        )
+        
         c_size = st.number_input("Chunk size", 800, key="rcsi")
         c_over = st.number_input("Overlap", 128, key="rcov")
         max_tk = st.number_input("Context Tokens", 4096, key="rctx")
@@ -701,10 +858,6 @@ if choice == "Simple QA (RAG)":
                 st.stop()
         
         if st.button("Index / Re-index", key="rib"):
-            if not LANGCHAIN_AVAILABLE:
-                st.error("LangChain libraries are not available. Please install them: pip install langchain langchain-community pypdf")
-                st.stop()
-            
             with st.spinner("Indexing..."):
                 em = EmbeddingManagerRAG(emb_m); vs = VectorStoreRAG()
                 all_chunks = []
@@ -714,11 +867,17 @@ if choice == "Simple QA (RAG)":
                             t.write(f.getbuffer())
                             t.flush()
                             h = sha256_file_shared(t.name)
-                            ldr = PyPDFLoader(t.name)
-                            docs = ldr.load()
+                            
+                            # Load PDF using PyMuPDF
+                            docs = load_pdf_with_pymupdf(t.name)
+                            
+                            # Update metadata
                             for d in docs:
                                 d.metadata.update({"file_hash": h, "source_file": f.name})
-                            all_chunks.extend(RecursiveCharacterTextSplitter(chunk_size=c_size, chunk_overlap=c_over).split_documents(docs))
+                            
+                            # Apply selected chunking method
+                            chunks = apply_chunking_method(docs, chunk_method, c_size, c_over)
+                            all_chunks.extend(chunks)
                         finally:
                             # Ensure temporary file is deleted
                             # Failures are acceptable here as the OS may have already cleaned up
