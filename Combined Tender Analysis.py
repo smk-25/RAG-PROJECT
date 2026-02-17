@@ -993,9 +993,11 @@ VARIATIONS:"""
 
             # Filter out lines that look like numbered/bulleted lists or are too short
 
-            variations = [line.strip() for line in response.strip().split('\n') 
-
-                         if line.strip() and len(line.strip()) > 3 and not re.match(r'^[\d\w][\.\)\:]', line.strip())]
+            variations = []
+            for line in response.strip().split('\n'):
+                stripped = line.strip()
+                if stripped and len(stripped) > 3 and not re.match(r'^[\d\w][\.\)\:]', stripped):
+                    variations.append(stripped)
 
 
 
