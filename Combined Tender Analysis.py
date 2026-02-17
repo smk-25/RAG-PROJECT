@@ -2042,6 +2042,23 @@ def render_citation_preview_sum(doc, cites):
 
 
 
+def _format_pages_column(df):
+    """Helper function to convert pages list to string for better display"""
+    if "pages" in df.columns:
+        df["pages"] = df["pages"].apply(lambda x: ", ".join(map(str, x)) if isinstance(x, list) else str(x))
+    return df
+
+
+def sanitize_filename(text, max_length=30):
+    """Sanitize text for use in filenames by removing invalid characters"""
+    # Remove or replace invalid filename characters
+    invalid_chars = '<>:"/\\|?*'
+    for char in invalid_chars:
+        text = text.replace(char, '_')
+    # Limit length and strip whitespace
+    return text[:max_length].strip().replace(' ', '_')
+
+
 def convert_result_to_dataframe(result, objective):
     """Convert summarization result JSON to pandas DataFrame based on objective type"""
     
@@ -2049,49 +2066,32 @@ def convert_result_to_dataframe(result, objective):
         return None
     
     try:
-        if objective == "Compliance Matrix":
-            if "matrix" in result:
-                df = pd.DataFrame(result["matrix"])
-                # Convert pages list to string for better display
-                if "pages" in df.columns:
-                    df["pages"] = df["pages"].apply(lambda x: ", ".join(map(str, x)) if isinstance(x, list) else str(x))
-                return df
+        df = None
         
-        elif objective == "Risk Assessment":
-            if "risks" in result:
-                df = pd.DataFrame(result["risks"])
-                # Convert pages list to string for better display
-                if "pages" in df.columns:
-                    df["pages"] = df["pages"].apply(lambda x: ", ".join(map(str, x)) if isinstance(x, list) else str(x))
-                return df
+        if objective == "Compliance Matrix" and "matrix" in result:
+            df = pd.DataFrame(result["matrix"])
         
-        elif objective == "Entity Dashboard":
-            if "entities" in result:
-                df = pd.DataFrame(result["entities"])
-                # Convert pages list to string for better display
-                if "pages" in df.columns:
-                    df["pages"] = df["pages"].apply(lambda x: ", ".join(map(str, x)) if isinstance(x, list) else str(x))
-                return df
+        elif objective == "Risk Assessment" and "risks" in result:
+            df = pd.DataFrame(result["risks"])
         
-        elif objective == "Ambiguity Scrutiny":
-            if "ambiguities" in result:
-                df = pd.DataFrame(result["ambiguities"])
-                # Convert pages list to string for better display
-                if "pages" in df.columns:
-                    df["pages"] = df["pages"].apply(lambda x: ", ".join(map(str, x)) if isinstance(x, list) else str(x))
-                return df
+        elif objective == "Entity Dashboard" and "entities" in result:
+            df = pd.DataFrame(result["entities"])
+        
+        elif objective == "Ambiguity Scrutiny" and "ambiguities" in result:
+            df = pd.DataFrame(result["ambiguities"])
         
         elif objective == "General Summary":
             # For general summary, try to extract any list data
             for key in result.keys():
                 if isinstance(result[key], list) and result[key]:
                     df = pd.DataFrame(result[key])
-                    # Convert any pages columns
-                    if "pages" in df.columns:
-                        df["pages"] = df["pages"].apply(lambda x: ", ".join(map(str, x)) if isinstance(x, list) else str(x))
-                    return df
+                    break
         
-        return None
+        # Format pages column if DataFrame was created
+        if df is not None:
+            df = _format_pages_column(df)
+        
+        return df
     except Exception as e:
         st.warning(f"Could not convert result to table: {e}")
         return None
@@ -2121,7 +2121,7 @@ def export_to_excel(df, query, objective):
                     try:
                         if len(str(cell.value)) > max_length:
                             max_length = len(str(cell.value))
-                    except:
+                    except (TypeError, AttributeError):
                         pass
                 adjusted_width = min(max_length + 2, 50)
                 worksheet.column_dimensions[column[0].column_letter].width = adjusted_width
@@ -2872,10 +2872,12 @@ else:
                 with col1:
                     excel_data = export_to_excel(df, r['query'], s_obj)
                     if excel_data:
+                        safe_objective = sanitize_filename(s_obj)
+                        safe_query = sanitize_filename(r['query'])
                         st.download_button(
                             label="📥 Download Excel",
                             data=excel_data,
-                            file_name=f"{s_obj.replace(' ', '_')}_{r['query'][:30].replace(' ', '_')}.xlsx",
+                            file_name=f"{safe_objective}_{safe_query}.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                             key=f"excel_{r['query']}"
                         )
@@ -2883,10 +2885,12 @@ else:
                 with col2:
                     word_data = export_to_word(df, r['query'], s_obj)
                     if word_data:
+                        safe_objective = sanitize_filename(s_obj)
+                        safe_query = sanitize_filename(r['query'])
                         st.download_button(
                             label="📥 Download Word",
                             data=word_data,
-                            file_name=f"{s_obj.replace(' ', '_')}_{r['query'][:30].replace(' ', '_')}.docx",
+                            file_name=f"{safe_objective}_{safe_query}.docx",
                             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                             key=f"word_{r['query']}"
                         )
