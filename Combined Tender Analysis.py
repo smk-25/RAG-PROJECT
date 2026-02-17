@@ -941,8 +941,7 @@ class GroqLLMRAG:
         # Note: Citation logic is handled separately by dedicated citation functions
 
         p = f"""{prompt_instr}
-
-TASK: Answer the user's question using ONLY the provided context.
+TASK: Answer the user's question using ONLY the provided context from tender documents.
 
 CONTEXT:
 {ctx}
@@ -950,12 +949,15 @@ CONTEXT:
 QUESTION: {q}
 
 INSTRUCTIONS:
-1. Answer must be based exclusively on the context above
-2. If the context doesn't contain relevant information, respond: "The provided context does not contain sufficient information to answer this question."
-3. Use clear, professional language with short paragraphs
-4. Each statement must be traceable to the context
-5. Provide specific details from the context when available (e.g., dates, numbers, requirements)
-6. Output format: Plain text response with NO markdown or special formatting unless present in original context
+1. Answer must be based EXCLUSIVELY on the context above - do not add external knowledge
+2. If the context doesn't contain complete information, state: "The provided context contains partial information:" and explain what is available
+3. If the context contains no relevant information, respond: "The provided context does not contain sufficient information to answer this question."
+4. For tender-related questions, distinguish between mandatory requirements (must/shall) and optional items (should/may)
+5. Use clear, professional language with short paragraphs
+6. Each statement must be directly traceable to the context provided
+7. Cite specific details from context when available (dates, numbers, requirements, page references)
+8. If the question has multiple parts, address each part separately
+9. Output format: Plain text response with NO markdown or special formatting unless present in original context
 
 ANSWER:"""
 
