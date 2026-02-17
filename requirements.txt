@@ -22,3 +22,4 @@ numpy
 pandas
 tabulate
 google-genai
+openpyxl

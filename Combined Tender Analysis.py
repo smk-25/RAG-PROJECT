@@ -2042,6 +2042,135 @@ def render_citation_preview_sum(doc, cites):
 
 
 
+def convert_result_to_dataframe(result, objective):
+    """Convert summarization result JSON to pandas DataFrame based on objective type"""
+    
+    if not isinstance(result, dict):
+        return None
+    
+    try:
+        if objective == "Compliance Matrix":
+            if "matrix" in result:
+                df = pd.DataFrame(result["matrix"])
+                # Convert pages list to string for better display
+                if "pages" in df.columns:
+                    df["pages"] = df["pages"].apply(lambda x: ", ".join(map(str, x)) if isinstance(x, list) else str(x))
+                return df
+        
+        elif objective == "Risk Assessment":
+            if "risks" in result:
+                df = pd.DataFrame(result["risks"])
+                # Convert pages list to string for better display
+                if "pages" in df.columns:
+                    df["pages"] = df["pages"].apply(lambda x: ", ".join(map(str, x)) if isinstance(x, list) else str(x))
+                return df
+        
+        elif objective == "Entity Dashboard":
+            if "entities" in result:
+                df = pd.DataFrame(result["entities"])
+                # Convert pages list to string for better display
+                if "pages" in df.columns:
+                    df["pages"] = df["pages"].apply(lambda x: ", ".join(map(str, x)) if isinstance(x, list) else str(x))
+                return df
+        
+        elif objective == "Ambiguity Scrutiny":
+            if "ambiguities" in result:
+                df = pd.DataFrame(result["ambiguities"])
+                # Convert pages list to string for better display
+                if "pages" in df.columns:
+                    df["pages"] = df["pages"].apply(lambda x: ", ".join(map(str, x)) if isinstance(x, list) else str(x))
+                return df
+        
+        elif objective == "General Summary":
+            # For general summary, try to extract any list data
+            for key in result.keys():
+                if isinstance(result[key], list) and result[key]:
+                    df = pd.DataFrame(result[key])
+                    # Convert any pages columns
+                    if "pages" in df.columns:
+                        df["pages"] = df["pages"].apply(lambda x: ", ".join(map(str, x)) if isinstance(x, list) else str(x))
+                    return df
+        
+        return None
+    except Exception as e:
+        st.warning(f"Could not convert result to table: {e}")
+        return None
+
+
+def export_to_excel(df, query, objective):
+    """Export DataFrame to Excel file and return bytes"""
+    
+    if df is None or df.empty:
+        return None
+    
+    try:
+        from io import BytesIO
+        output = BytesIO()
+        
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df.to_excel(writer, index=False, sheet_name='Results')
+            
+            # Get the worksheet
+            worksheet = writer.sheets['Results']
+            
+            # Auto-adjust column widths
+            for column in worksheet.columns:
+                max_length = 0
+                column = [cell for cell in column]
+                for cell in column:
+                    try:
+                        if len(str(cell.value)) > max_length:
+                            max_length = len(str(cell.value))
+                    except:
+                        pass
+                adjusted_width = min(max_length + 2, 50)
+                worksheet.column_dimensions[column[0].column_letter].width = adjusted_width
+        
+        output.seek(0)
+        return output.getvalue()
+    except Exception as e:
+        st.error(f"Error creating Excel file: {e}")
+        return None
+
+
+def export_to_word(df, query, objective):
+    """Export DataFrame to Word document and return bytes"""
+    
+    if df is None or df.empty:
+        return None
+    
+    try:
+        from io import BytesIO
+        output = BytesIO()
+        
+        doc = Document()
+        doc.add_heading(f'{objective} - Results', 0)
+        doc.add_paragraph(f'Query: {query}')
+        doc.add_paragraph('')
+        
+        # Add table
+        table = doc.add_table(rows=1, cols=len(df.columns))
+        table.style = 'Light Grid Accent 1'
+        
+        # Add header row
+        header_cells = table.rows[0].cells
+        for i, column_name in enumerate(df.columns):
+            header_cells[i].text = str(column_name)
+        
+        # Add data rows
+        for _, row in df.iterrows():
+            row_cells = table.add_row().cells
+            for i, value in enumerate(row):
+                row_cells[i].text = str(value) if value is not None else ''
+        
+        doc.save(output)
+        output.seek(0)
+        return output.getvalue()
+    except Exception as e:
+        st.error(f"Error creating Word document: {e}")
+        return None
+
+
 # --------------------------
 
 # Main Program logic
@@ -2727,6 +2856,40 @@ else:
 
             st.info(f"Confidence: {conf['overall_confidence']:.2%}")
 
+
+            
+            # Convert results to table format and display
+            df = convert_result_to_dataframe(r["result"], s_obj)
+            
+            if df is not None and not df.empty:
+                st.markdown("---")
+                st.markdown("### 📊 Results Table")
+                st.dataframe(df, use_container_width=True)
+                
+                # Export buttons
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    excel_data = export_to_excel(df, r['query'], s_obj)
+                    if excel_data:
+                        st.download_button(
+                            label="📥 Download Excel",
+                            data=excel_data,
+                            file_name=f"{s_obj.replace(' ', '_')}_{r['query'][:30].replace(' ', '_')}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            key=f"excel_{r['query']}"
+                        )
+                
+                with col2:
+                    word_data = export_to_word(df, r['query'], s_obj)
+                    if word_data:
+                        st.download_button(
+                            label="📥 Download Word",
+                            data=word_data,
+                            file_name=f"{s_obj.replace(' ', '_')}_{r['query'][:30].replace(' ', '_')}.docx",
+                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                            key=f"word_{r['query']}"
+                        )
 
 
             # Find pages for preview
