@@ -2935,10 +2935,12 @@ else:
                 # Special handling for empty Entity Dashboard
                 st.markdown("---")
                 st.markdown("### 📊 Entity Dashboard")
-                st.info("ℹ️ No entities were found in the analyzed document sections. This could mean:\n"
-                       "- The document sections don't contain recognizable entities\n"
-                       "- The query may need to be adjusted\n"
-                       "- Try analyzing different sections or the entire document")
+                st.info(
+                    "ℹ️ No entities were found in the analyzed document sections. This could mean:\n"
+                    "- The document sections don't contain recognizable entities\n"
+                    "- The query may need to be adjusted\n"
+                    "- Try analyzing different sections or the entire document"
+                )
                 
                 # Show entity count summary (will display zeros for all categories)
                 if isinstance(r["result"], dict) and "entity_count" in r["result"]:
