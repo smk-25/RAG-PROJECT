@@ -1804,7 +1804,7 @@ ENTITY CATEGORIES:
 OUTPUT FORMAT (strict JSON array):
 [
   {
-    "category": "One of: Organization, Person, Location, Date, Financial, Technical",
+    "category": "One of: Organizations, People, Locations, Dates, Financial, Technical",
     "entity": "The specific entity name or value",
     "context": "Brief context about relevance",
     "page": 1
@@ -2935,7 +2935,7 @@ else:
 
                     for k, v in o.items():
 
-                        if k in ["page", "citations"]:
+                        if k in ["page", "pages", "citations"]:
 
                             if isinstance(v, list):
 
