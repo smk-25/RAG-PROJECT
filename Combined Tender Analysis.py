@@ -1689,7 +1689,11 @@ If no requirements found in this chunk, return: []"""
         
         reduce_system = """You are consolidating compliance requirements from multiple document chunks into a unified matrix."""
         
-        reduce_instruction = """Merge all extracted requirements into a comprehensive compliance matrix.
+        reduce_instruction = """You will receive mapped findings from document analysis in the 'D:' parameter below.
+USE THIS DATA to create your comprehensive compliance matrix. The D: parameter contains an array of findings from the map phase.
+If D: contains empty arrays or no requirements, still generate the report structure with empty matrix array and appropriate summary statistics.
+
+Merge all extracted requirements into a comprehensive compliance matrix.
 
 CONSOLIDATION RULES:
 1. Remove exact duplicates (same requirement appearing multiple times)
@@ -1747,7 +1751,11 @@ If no risks identified, return: []"""
         
         reduce_system = """You are consolidating risk assessments from multiple document chunks."""
         
-        reduce_instruction = """Merge all identified risks into a comprehensive risk assessment.
+        reduce_instruction = """You will receive mapped findings from document analysis in the 'D:' parameter below.
+USE THIS DATA to create your comprehensive risk assessment. The D: parameter contains an array of findings from the map phase.
+If D: contains empty arrays or no risks, still generate the report structure with empty risks array and appropriate summary statistics.
+
+Merge all identified risks into a comprehensive risk assessment.
 
 CONSOLIDATION RULES:
 1. Remove duplicate risk entries
@@ -1807,7 +1815,11 @@ If no entities found, return: []"""
         
         reduce_system = """You are compiling entities into an organized dashboard."""
         
-        reduce_instruction = """Consolidate all entities into a structured dashboard.
+        reduce_instruction = """You will receive mapped findings from document analysis in the 'D:' parameter below.
+USE THIS DATA to create your structured entity dashboard. The D: parameter contains an array of findings from the map phase.
+If D: contains empty arrays or no entities, still generate the report structure with empty dashboard categories and appropriate summary statistics.
+
+Consolidate all entities into a structured dashboard.
 
 COMPILATION RULES:
 1. Group entities by category
@@ -1868,7 +1880,11 @@ If no ambiguities found in this chunk, return: []"""
         
         reduce_system = """You are consolidating ambiguity findings from multiple document chunks into a comprehensive report."""
         
-        reduce_instruction = """Merge all identified ambiguities into a comprehensive scrutiny report.
+        reduce_instruction = """You will receive mapped findings from document analysis in the 'D:' parameter below.
+USE THIS DATA to create your comprehensive scrutiny report. The D: parameter contains an array of findings from the map phase.
+If D: contains empty arrays or no ambiguity findings, still generate the report structure with empty ambiguities array and appropriate summary statistics.
+
+Merge all identified ambiguities into a comprehensive scrutiny report.
 
 CONSOLIDATION RULES:
 1. Remove duplicate ambiguities (same issue appearing multiple times)
@@ -1929,7 +1945,11 @@ If chunk contains no significant information, return: []"""
         
         reduce_system = """You are synthesizing findings into a comprehensive summary."""
         
-        reduce_instruction = """Create a well-structured summary from all extracted findings.
+        reduce_instruction = """You will receive mapped findings from document analysis in the 'D:' parameter below.
+USE THIS DATA to create your comprehensive summary. The D: parameter contains an array of findings from the map phase.
+If D: contains empty arrays or no findings, still generate the report structure with empty key_findings array and appropriate summary statistics.
+
+Create a well-structured summary from all extracted findings.
 
 SYNTHESIS RULES:
 1. Organize findings by type and importance
