@@ -2104,7 +2104,7 @@ def convert_result_to_dataframe(result, objective):
                         if isinstance(item, dict):
                             item["category"] = category
                             entities.append(item)
-            df = pd.DataFrame(entities) if entities else None
+            df = pd.DataFrame(entities)  # Returns empty DataFrame if no entities
         
         elif objective == "Ambiguity Scrutiny" and "ambiguities" in result:
             df = pd.DataFrame(result["ambiguities"])
