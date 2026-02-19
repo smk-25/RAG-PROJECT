@@ -1985,7 +1985,7 @@ def compute_confidence_score_sum(mapped, reduced, q):
 
     c = {"snippet_coverage": min(1.0, len(mapped)/5.0), "result_coherence": 0.8 if isinstance(reduced, dict) and "error" not in reduced else 0.1, "information_density": 0.5, "citation_confidence": 0.7}
 
-    c["overall_confidence"] = 0.3*c["snippet_coverage"] + 0.3*c["result_coherence"] + 0.4*c["citation_confidence"]
+    c["overall_confidence"] = 0.25*c["snippet_coverage"] + 0.25*c["result_coherence"] + 0.25*c["information_density"] + 0.25*c["citation_confidence"]
 
     return c
 
@@ -2042,9 +2042,10 @@ def render_citation_preview_sum(doc, cites):
 
     st.markdown("### 📄 Context Preview")
 
-    tabs = st.tabs([f"Page {c['page']}" for c in cites[:5]])
+    # Show all pages, not just first 5
+    tabs = st.tabs([f"Page {c['page']}" for c in cites])
 
-    for i, c in enumerate(cites[:5]):
+    for i, c in enumerate(cites):
 
         with tabs[i]:
 
@@ -2054,7 +2055,7 @@ def render_citation_preview_sum(doc, cites):
 
                 pix = page.get_pixmap(matrix=fitz.Matrix(ZOOM_LEVEL, ZOOM_LEVEL))
 
-                st.image(pix.tobytes("png"))
+                st.image(pix.tobytes("png"), caption=f"Page {c['page']}", use_container_width=True)
 
             except Exception as e:
 
@@ -2094,8 +2095,16 @@ def convert_result_to_dataframe(result, objective):
         elif objective == "Risk Assessment" and "risks" in result:
             df = pd.DataFrame(result["risks"])
         
-        elif objective == "Entity Dashboard" and "entities" in result:
-            df = pd.DataFrame(result["entities"])
+        elif objective == "Entity Dashboard" and "dashboard" in result:
+            # Flatten the nested dashboard structure into a DataFrame
+            entities = []
+            for category, items in result["dashboard"].items():
+                if isinstance(items, list):
+                    for item in items:
+                        if isinstance(item, dict):
+                            item["category"] = category
+                            entities.append(item)
+            df = pd.DataFrame(entities) if entities else None
         
         elif objective == "Ambiguity Scrutiny" and "ambiguities" in result:
             df = pd.DataFrame(result["ambiguities"])
