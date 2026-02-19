@@ -2102,9 +2102,17 @@ def convert_result_to_dataframe(result, objective):
                 if isinstance(items, list):
                     for item in items:
                         if isinstance(item, dict):
-                            item["category"] = category
-                            entities.append(item)
-            df = pd.DataFrame(entities)  # Returns empty DataFrame if no entities
+                            # Shallow copy to avoid mutating the original result dictionary
+                            item_copy = item.copy()
+                            item_copy["category"] = category
+                            entities.append(item_copy)
+            
+            # Create DataFrame from entities
+            if entities:
+                df = pd.DataFrame(entities)
+            else:
+                # Create empty DataFrame with expected columns for consistent output
+                df = pd.DataFrame(columns=["category", "entity", "context", "page"])
         
         elif objective == "Ambiguity Scrutiny" and "ambiguities" in result:
             df = pd.DataFrame(result["ambiguities"])
@@ -2923,6 +2931,22 @@ else:
                             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                             key=f"word_{r['query']}"
                         )
+            elif df is not None and df.empty and s_obj == "Entity Dashboard":
+                # Special handling for empty Entity Dashboard
+                st.markdown("---")
+                st.markdown("### 📊 Entity Dashboard")
+                st.info(
+                    "ℹ️ No entities were found in the analyzed document sections. This could mean:\n"
+                    "- The document sections don't contain recognizable entities\n"
+                    "- The query may need to be adjusted\n"
+                    "- Try analyzing different sections or the entire document"
+                )
+                
+                # Show entity count summary (will display zeros for all categories)
+                if isinstance(r["result"], dict) and "entity_count" in r["result"]:
+                    st.markdown("**Entity Count Summary:**")
+                    entity_count_df = pd.DataFrame([r["result"]["entity_count"]])
+                    st.dataframe(entity_count_df, use_container_width=True)
 
 
             # Find pages for preview
