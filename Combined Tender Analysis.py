@@ -28,6 +28,8 @@ import asyncio
 
 import random
 
+import copy
+
 from pathlib import Path
 
 from typing import List, Dict, Any, Optional, Tuple
@@ -2102,8 +2104,9 @@ def convert_result_to_dataframe(result, objective):
                 if isinstance(items, list):
                     for item in items:
                         if isinstance(item, dict):
-                            # Create a copy to avoid modifying the original result
-                            item_copy = item.copy()
+                            # Create a deep copy to avoid modifying the original result
+                            # Deep copy ensures complete isolation even if nested structures exist
+                            item_copy = copy.deepcopy(item)
                             item_copy["category"] = category
                             entities.append(item_copy)
             
