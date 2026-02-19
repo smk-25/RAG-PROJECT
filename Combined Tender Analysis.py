@@ -2940,7 +2940,7 @@ else:
                        "- The query may need to be adjusted\n"
                        "- Try analyzing different sections or the entire document")
                 
-                # Still show the entity count summary if available
+                # Show entity count summary (will display zeros for all categories)
                 if isinstance(r["result"], dict) and "entity_count" in r["result"]:
                     st.markdown("**Entity Count Summary:**")
                     entity_count_df = pd.DataFrame([r["result"]["entity_count"]])
