@@ -2104,8 +2104,7 @@ def convert_result_to_dataframe(result, objective):
                 if isinstance(items, list):
                     for item in items:
                         if isinstance(item, dict):
-                            # Create a deep copy to avoid modifying the original result
-                            # Deep copy ensures complete isolation even if nested structures exist
+                            # Deep copy to avoid mutating the original result dictionary
                             item_copy = copy.deepcopy(item)
                             item_copy["category"] = category
                             entities.append(item_copy)
@@ -2114,8 +2113,7 @@ def convert_result_to_dataframe(result, objective):
             if entities:
                 df = pd.DataFrame(entities)
             else:
-                # Create an empty DataFrame with the expected column structure
-                # This ensures consistent output even when no entities are found
+                # Create empty DataFrame with expected columns for consistent output
                 df = pd.DataFrame(columns=["category", "entity", "context", "page"])
         
         elif objective == "Ambiguity Scrutiny" and "ambiguities" in result:
