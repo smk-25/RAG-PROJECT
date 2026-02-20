@@ -2222,7 +2222,7 @@ choice = st.sidebar.radio("Choose Program", ["Simple QA (RAG)", "Context Underst
 
 if choice == "Simple QA (RAG)":
 
-    st.title("AI ASSISTED TENDER DOCUMENT ANALYSIS USING RAG FRAMEWORK")
+    st.title("Tender Analyser-Simple QA Mode")
 
     with st.sidebar:
 
@@ -2695,7 +2695,7 @@ if choice == "Simple QA (RAG)":
 
 else:
 
-    st.title("Tender Analyzer — Gemini Map/Reduce")
+    st.title("Tender Analyzer — Context Understanding Mode")
 
     with st.sidebar:
 
