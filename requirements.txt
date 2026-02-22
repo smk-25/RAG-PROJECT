@@ -22,3 +22,4 @@ google-genai
 python-docx
 openpyxl
 tabulate
+gTTS>=2.5
