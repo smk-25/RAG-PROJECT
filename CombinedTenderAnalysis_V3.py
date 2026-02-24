@@ -691,28 +691,35 @@ def get_sum_prompts(mode: str):
 def get_sum_prompts_full(mode: str):
     if mode == "Compliance Matrix":
         map_system = "You are a compliance requirements extractor analyzing tender documents. Extract specific, actionable requirements."
-        map_instruction = """Extract ALL compliance requirements from chunk.
+        map_instruction = """Extract ALL compliance requirements from the provided Context Data.
 Rules: Identify must/shall, specific criteria, conditional clauses, page numbers.
 Format: JSON array [{item, detail, evidence, category, mandatory, page}]
-- evidence should be the exact quote from the document."""
+- evidence should be the exact quote from the document.
+- page: use the P: value from the chunk header that contains the requirement."""
         reduce_system = "You are consolidating compliance requirements into a unified matrix."
         reduce_instruction = """Consolidate finding D: into a unique matrix. Remove duplicates, merge similar with all pages.
+IMPORTANT: For each matrix item, collect and list all unique page numbers from the source findings in the 'pages' array.
 Format: JSON {matrix: [{item, detail, evidence, category, mandatory, pages:[]}], total_requirements, summary: {mandatory_count, optional_count, categories: {}}}"""
     elif mode == "Risk Assessment":
         map_system = "You are a risk analyst identifying risks, liabilities, and concerns."
-        map_instruction = """Extract ALL potential risks from chunk: Penalties, liabilities, tight deadlines, Ambiguity.
+        map_instruction = """Extract ALL potential risks from the provided Context Data. Look for: Penalties, liabilities, tight deadlines, ambiguous clauses, legal exposure.
 Format: JSON array [{clause, reason, evidence, risk_level, risk_type, impact, page}]
-- evidence should be the exact quote from the document."""
+- evidence should be the exact quote from the document.
+- page: use the P: value from the chunk header that contains the risk.
+RULE: Every item in the output array MUST have a non-empty evidence field and a valid page number from the chunk header."""
         reduce_system = "You are consolidating risk assessments."
-        reduce_instruction = """Consolidate D: into unique risks. Prioritize High/Critical.
+        reduce_instruction = """Consolidate finding D: into unique risks. Prioritize High/Critical.
+IMPORTANT: For each risk item, collect and list all unique page numbers from the source findings into the 'pages' array. Do NOT leave pages empty.
 Format: JSON {risks: [{clause, reason, evidence, risk_level, risk_type, impact, pages:[]}], risk_summary: {total_risks, critical_count, high_count, medium_count, low_count, by_type: {}}}"""
     elif mode == "Entity Dashboard":
         map_system = "You are extracting key entities and metadata."
-        map_instruction = """Extract Organizations, People, Locations, Dates, Financials, Technicals.
-Format: JSON array [{category, entity, context, page}]"""
+        map_instruction = """Extract Organizations, People, Locations, Dates, Financials, Technicals from the provided Context Data.
+Format: JSON array [{category, entity, context, page}]
+- page: use the P: value from the chunk header that contains the entity."""
         reduce_system = "You are compiling entities into a dashboard."
-        reduce_instruction = """Consolidate D: into dashboard categories. Remove duplicates.
-Format: JSON {dashboard: {Organizations:[], People:[], ...}, entity_count: {...}}"""
+        reduce_instruction = """Consolidate finding D: into dashboard categories. Remove duplicates. Preserve the page number for each entity.
+IMPORTANT: For each entity, collect all unique page numbers from the source findings into the 'pages' array.
+Format: JSON {dashboard: {Organizations:[{entity, context, pages:[]}], People:[{entity, context, pages:[]}], Locations:[{entity, context, pages:[]}], Dates:[{entity, context, pages:[]}], Financials:[{entity, context, pages:[]}], Technicals:[{entity, context, pages:[]}]}, entity_count: {}}"""
     elif mode == "Ambiguity Scrutiny":
         map_system = "You are an expert analyst identifying ambiguous, vague, or contradictory language in tender documents."
         map_instruction = """Extract instances of vague terms ("reasonable", "appropriate"), unclear requirements, contradictions between sections, and missing details from the provided Context Data.
@@ -728,13 +735,14 @@ CRITICAL: Preserve the exact 'evidence' text from each finding verbatim — do N
 Format: JSON {ambiguities: [{ambiguous_text, ambiguity_type, issue, evidence, suggested_query, severity, pages:[], recommendation}], summary, overall_assessment: "Brief assessment."}"""
     elif mode == "Overall Summary & Voice":
         map_system = "You are a senior analyst extracting high-density data for a 15-minute executive briefing."
-        map_instruction = """Extract ALL critical information across these domains:
+        map_instruction = """Extract ALL critical information across these domains from the provided Context Data:
 1. Project Scope & Objectives
 2. Timelines & Milestones
 3. Financials (Budget, Penalties, Payment Terms)
 4. Technical Features (Mechanical, Electrical, Automation)
 5. Legal & Liability
-Format: JSON array [{domain, topic, detail, evidence, importance, page}]"""
+Format: JSON array [{domain, topic, detail, evidence, importance, page}]
+- page: use the P: value from the chunk header that contains the information."""
         reduce_system = "You are a briefing expert synthesizing a massive, detailed tender overview."
         reduce_instruction = """Synthesize D: into an extremely detailed, long-form narrative summary designed to be read as a 10-15 minute briefing.
 You MUST include dedicated sections for:
@@ -749,8 +757,9 @@ You MUST include dedicated sections for:
 Format: JSON {summary: "500+ words overview", key_findings: [{finding, detail, domain, pages:[]}], audio_script: "A 2000+ word detailed narrative script for the audio briefing", citations: []}"""
     else:
         map_system = "You are extracting key findings from tender documents."
-        map_instruction = """Extract topics, critical requirements, facts, figures.
-Format: JSON array [{finding, detail, type, importance, page}]"""
+        map_instruction = """Extract topics, critical requirements, facts, figures from the provided Context Data.
+Format: JSON array [{finding, detail, type, importance, page}]
+- page: use the P: value from the chunk header that contains the finding."""
         reduce_system = "You are synthesizing findings."
         reduce_instruction = """Synthesize D: into a coherent narrative. IMPORTANT: For each key finding, you MUST collect and list all unique page numbers from the source snippets in a 'pages' array.
 Format: JSON {summary: "2-3 paragraphs", key_findings: [{finding, detail, importance, pages:[]}], citations: [], finding_stats: {}}"""
@@ -851,7 +860,7 @@ def convert_result_to_dataframe(result, objective):
                 if isinstance(items, list):
                     for it in items:
                         if isinstance(it, dict): it_c = it.copy(); it_c["category"] = cat; entities.append(it_c)
-            df = pd.DataFrame(entities) if entities else pd.DataFrame(columns=["category", "entity", "context", "page"])
+            df = pd.DataFrame(entities) if entities else pd.DataFrame(columns=["category", "entity", "context", "pages"])
         elif objective == "Ambiguity Scrutiny" and "ambiguities" in result: df = pd.DataFrame(result["ambiguities"])
         elif objective == "General Summary":
             for k in result.keys():
