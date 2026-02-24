@@ -710,6 +710,7 @@ RULE: Every item in the output array MUST have a non-empty evidence field and a 
         reduce_system = "You are consolidating risk assessments."
         reduce_instruction = """Consolidate finding D: into unique risks. Prioritize High/Critical.
 IMPORTANT: For each risk item, collect and list all unique page numbers from the source findings into the 'pages' array. Do NOT leave pages empty.
+CRITICAL: Preserve the exact 'evidence' text from each finding verbatim — do NOT modify, summarize, or omit the evidence values. Every risk item MUST have a non-empty evidence field.
 Format: JSON {risks: [{clause, reason, evidence, risk_level, risk_type, impact, pages:[]}], risk_summary: {total_risks, critical_count, high_count, medium_count, low_count, by_type: {}}}"""
     elif mode == "Entity Dashboard":
         map_system = "You are extracting key entities and metadata."
@@ -1240,6 +1241,24 @@ else:
                         if items and isinstance(items, list):
                             st.markdown(f"**{cat}** ({len(items)})")
                             st.dataframe(pd.DataFrame(items), use_container_width=True)
+                elif s_obj == "Risk Assessment" and "risks" in r["result"]:
+                    risks = r["result"]["risks"]
+                    for idx, risk in enumerate(risks):
+                        if not isinstance(risk, dict): continue
+                        with st.container():
+                            st.markdown(f"**{idx+1}. {risk.get('risk_type', 'Risk')}** — `{risk.get('risk_level', 'Unknown')}` severity")
+                            st.write(f"**Clause:** {risk.get('clause', 'N/A')}")
+                            st.write(f"**Reason:** {risk.get('reason', 'N/A')}")
+                            if risk.get('evidence'):
+                                st.markdown(f"**Evidence:** *\"{risk['evidence']}\"*")
+                            else:
+                                st.warning("**Evidence:** Not captured")
+                            st.write(f"**Impact:** {risk.get('impact', 'N/A')}")
+                            st.caption(f"Pages: {risk.get('pages', [])}")
+                            st.markdown("---")
+                    risk_summary = r["result"].get("risk_summary")
+                    if risk_summary:
+                        st.info(f"**Risk Summary:** Total: {risk_summary.get('total_risks', 0)} | Critical: {risk_summary.get('critical_count', 0)} | High: {risk_summary.get('high_count', 0)} | Medium: {risk_summary.get('medium_count', 0)} | Low: {risk_summary.get('low_count', 0)}")
                 elif s_obj == "Ambiguity Scrutiny" and "ambiguities" in r["result"]:
                     ambs = r["result"]["ambiguities"]
                     for idx, a in enumerate(ambs):
