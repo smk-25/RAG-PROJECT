@@ -715,13 +715,16 @@ Format: JSON array [{category, entity, context, page}]"""
 Format: JSON {dashboard: {Organizations:[], People:[], ...}, entity_count: {...}}"""
     elif mode == "Ambiguity Scrutiny":
         map_system = "You are an expert analyst identifying ambiguous, vague, or contradictory language in tender documents."
-        map_instruction = """Extract instances of vague terms ("reasonable", "appropriate"), unclear requirements, contradictions between sections, and missing details.
+        map_instruction = """Extract instances of vague terms ("reasonable", "appropriate"), unclear requirements, contradictions between sections, and missing details from the provided Context Data.
 Format: JSON array [{ambiguous_text, ambiguity_type, issue, evidence, suggested_query, severity, page}]
-- ambiguous_text should be the specific vague or unclear term/phrase identified (e.g., "reasonable timeframe").
-- evidence should be the full sentence or clause from the document containing the ambiguous text, as an exact quote.
-- suggested_query should be a formal question for the authority to clarify the point."""
+- ambiguous_text: the specific vague or unclear term/phrase identified (e.g., "reasonable timeframe").
+- evidence: MANDATORY - copy the EXACT verbatim sentence or clause from the Text: field of the chunk that contains the ambiguous text. Do NOT paraphrase, summarize, or leave this blank.
+- suggested_query: a formal question for the authority to clarify the point.
+- page: use the P: value from the chunk header that contains the ambiguous text.
+RULE: Every item in the output array MUST have a non-empty evidence field taken verbatim from the source Text."""
         reduce_system = "You are consolidating ambiguity findings into a formal pre-bid query report."
         reduce_instruction = """Consolidate finding D: into a comprehensive Scrutiny Report. Refine the suggested_query for each finding.
+CRITICAL: Preserve the exact 'evidence' text from each finding verbatim — do NOT modify, summarize, or omit the evidence values.
 Format: JSON {ambiguities: [{ambiguous_text, ambiguity_type, issue, evidence, suggested_query, severity, pages:[], recommendation}], summary, overall_assessment: "Brief assessment."}"""
     elif mode == "Overall Summary & Voice":
         map_system = "You are a senior analyst extracting high-density data for a 15-minute executive briefing."
