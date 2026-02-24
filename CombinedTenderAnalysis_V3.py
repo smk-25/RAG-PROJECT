@@ -883,8 +883,8 @@ def export_to_word(df, query, objective, result=None):
         doc.add_heading(f'{objective} Analysis', 0)
         doc.add_paragraph(f'Query: {query}')
         
-        if objective == "General Summary" and result:
-            # Narrative format for General Summary
+        if objective in ("General Summary", "Overall Summary & Voice") and result:
+            # Narrative format for General Summary and Overall Summary & Voice
             if result.get("summary"):
                 doc.add_heading('Executive Summary', level=1)
                 doc.add_paragraph(result["summary"])
@@ -895,6 +895,8 @@ def export_to_word(df, query, objective, result=None):
                     heading = item.get("finding", "Finding")
                     doc.add_heading(heading, level=2)
                     doc.add_paragraph(item.get("detail", "N/A"))
+                    if item.get("domain"):
+                        doc.add_paragraph(f"Domain: {item['domain']}")
                     if item.get("pages"):
                         p_str = ", ".join(map(str, item["pages"]))
                         doc.add_paragraph(f"Source Pages: {p_str}").italic = True
@@ -902,6 +904,10 @@ def export_to_word(df, query, objective, result=None):
             if result.get("overall_assessment"):
                 doc.add_heading('Overall Assessment', level=1)
                 doc.add_paragraph(result["overall_assessment"])
+            
+            if objective == "Overall Summary & Voice" and result.get("audio_script"):
+                doc.add_heading('Audio Script', level=1)
+                doc.add_paragraph(result["audio_script"])
         else:
             # Default table format for other objectives
             if df is None or df.empty: return None
@@ -1222,10 +1228,13 @@ else:
                 if s_obj == "Entity Dashboard" and "dashboard" in r["result"]:
                     dash = r["result"]["dashboard"]
                     for cat, items in dash.items():
-                        if items: st.markdown(f"**{cat}** ({len(items)})"); st.dataframe(pd.DataFrame(items), use_container_width=True)
+                        if items and isinstance(items, list):
+                            st.markdown(f"**{cat}** ({len(items)})")
+                            st.dataframe(pd.DataFrame(items), use_container_width=True)
                 elif s_obj == "Ambiguity Scrutiny" and "ambiguities" in r["result"]:
                     ambs = r["result"]["ambiguities"]
                     for idx, a in enumerate(ambs):
+                        if not isinstance(a, dict): continue
                         with st.container():
                             st.markdown(f"**{idx+1}. {a.get('ambiguity_type', 'Ambiguity')}**")
                             st.write(f"**Issue:** {a.get('issue', 'N/A')}")
