@@ -600,9 +600,11 @@ def clean_json_string(txt):
             txt = parts[0].strip() if parts else re.sub(r"^```(?:json)?\s*|\s*```$", "", txt).strip()
         except: pass
     if not (txt.startswith("{") or txt.startswith("[")):
-        start = txt.find("{"); start = txt.find("[") if start == -1 else start
-        if start != -1:
-            end = txt.rfind("}"); end = txt.rfind("]") if end == -1 else end
+        brace_pos = txt.find("{")
+        bracket_pos = txt.find("[")
+        start = min((p for p in [brace_pos, bracket_pos] if p != -1), default=-1)
+        if start != -1 and start < len(txt):
+            end = txt.rfind("]") if txt[start] == "[" else txt.rfind("}")
             if end > start: txt = txt[start:end+1]
     txt = re.sub(r',(\s*[}\]])', r'\1', txt)
     return txt
@@ -695,10 +697,12 @@ def get_sum_prompts_full(mode: str):
 Rules: Identify must/shall, specific criteria, conditional clauses, page numbers.
 Format: JSON array [{item, detail, evidence, category, mandatory, page}]
 - evidence should be the exact quote from the document.
-- page: use the P: value from the chunk header that contains the requirement."""
+- page: use the P: value from the chunk header that contains the requirement.
+RULE: Every item in the output array MUST have a non-empty evidence field taken verbatim from the source Text and a valid page number from the chunk header."""
         reduce_system = "You are consolidating compliance requirements into a unified matrix."
         reduce_instruction = """Consolidate finding D: into a unique matrix. Remove duplicates, merge similar with all pages.
 IMPORTANT: For each matrix item, collect and list all unique page numbers from the source findings in the 'pages' array.
+CRITICAL: Preserve the exact 'evidence' text from each finding verbatim — do NOT modify, summarize, or omit the evidence values. Every matrix item MUST have a non-empty evidence field.
 Format: JSON {matrix: [{item, detail, evidence, category, mandatory, pages:[]}], total_requirements, summary: {mandatory_count, optional_count, categories: {}}}"""
     elif mode == "Risk Assessment":
         map_system = "You are a risk analyst identifying risks, liabilities, and concerns."
@@ -716,7 +720,8 @@ Format: JSON {risks: [{clause, reason, evidence, risk_level, risk_type, impact, 
         map_system = "You are extracting key entities and metadata."
         map_instruction = """Extract Organizations, People, Locations, Dates, Financials, Technicals from the provided Context Data.
 Format: JSON array [{category, entity, context, page}]
-- page: use the P: value from the chunk header that contains the entity."""
+- page: use the P: value from the chunk header that contains the entity.
+RULE: Every item in the output array MUST have a valid page number using the P: value from the chunk header."""
         reduce_system = "You are compiling entities into a dashboard."
         reduce_instruction = """Consolidate finding D: into dashboard categories. Remove duplicates. Preserve the page number for each entity.
 IMPORTANT: For each entity, collect all unique page numbers from the source findings into the 'pages' array.
@@ -729,7 +734,7 @@ Format: JSON array [{ambiguous_text, ambiguity_type, issue, evidence, suggested_
 - evidence: MANDATORY - copy the EXACT verbatim sentence or clause from the Text: field of the chunk that contains the ambiguous text. Do NOT paraphrase, summarize, or leave this blank.
 - suggested_query: a formal question for the authority to clarify the point.
 - page: use the P: value from the chunk header that contains the ambiguous text.
-RULE: Every item in the output array MUST have a non-empty evidence field taken verbatim from the source Text."""
+RULE: Every item in the output array MUST have a non-empty evidence field taken verbatim from the source Text and a valid page number from the chunk header."""
         reduce_system = "You are consolidating ambiguity findings into a formal pre-bid query report."
         reduce_instruction = """Consolidate finding D: into a comprehensive Scrutiny Report. Refine the suggested_query for each finding.
 CRITICAL: Preserve the exact 'evidence' text from each finding verbatim — do NOT modify, summarize, or omit the evidence values.
@@ -743,7 +748,8 @@ Format: JSON {ambiguities: [{ambiguous_text, ambiguity_type, issue, evidence, su
 4. Technical Features (Mechanical, Electrical, Automation)
 5. Legal & Liability
 Format: JSON array [{domain, topic, detail, evidence, importance, page}]
-- page: use the P: value from the chunk header that contains the information."""
+- page: use the P: value from the chunk header that contains the information.
+RULE: Every item in the output array MUST have a non-empty evidence field and a valid page number from the chunk header."""
         reduce_system = "You are a briefing expert synthesizing a massive, detailed tender overview."
         reduce_instruction = """Synthesize D: into an extremely detailed, long-form narrative summary designed to be read as a 10-15 minute briefing.
 You MUST include dedicated sections for:
@@ -755,12 +761,14 @@ You MUST include dedicated sections for:
 - Technical Domain: Electrical Systems
 - Technical Domain: Automation & Control 
 - Risk & Liability Assessment
+CRITICAL: Preserve the exact 'evidence' text from each finding verbatim — do NOT modify, summarize, or omit the evidence values. For each key_finding, collect and list all unique page numbers from the source findings in the 'pages' array. Do NOT leave pages empty.
 Format: JSON {summary: "500+ words overview", key_findings: [{finding, detail, domain, pages:[]}], audio_script: "A 2000+ word detailed narrative script for the audio briefing", citations: []}"""
     else:
         map_system = "You are extracting key findings from tender documents."
         map_instruction = """Extract topics, critical requirements, facts, figures from the provided Context Data.
 Format: JSON array [{finding, detail, type, importance, page}]
-- page: use the P: value from the chunk header that contains the finding."""
+- page: use the P: value from the chunk header that contains the finding.
+RULE: Every item in the output array MUST have a valid page number from the chunk header."""
         reduce_system = "You are synthesizing findings."
         reduce_instruction = """Synthesize D: into a coherent narrative. IMPORTANT: For each key finding, you MUST collect and list all unique page numbers from the source snippets in a 'pages' array.
 Format: JSON {summary: "2-3 paragraphs", key_findings: [{finding, detail, importance, pages:[]}], citations: [], finding_stats: {}}"""
