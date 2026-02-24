@@ -716,12 +716,13 @@ Format: JSON {dashboard: {Organizations:[], People:[], ...}, entity_count: {...}
     elif mode == "Ambiguity Scrutiny":
         map_system = "You are an expert analyst identifying ambiguous, vague, or contradictory language in tender documents."
         map_instruction = """Extract instances of vague terms ("reasonable", "appropriate"), unclear requirements, contradictions between sections, and missing details.
-Format: JSON array [{ambiguous_text, ambiguity_type, issue, suggested_query, severity, page}]
-- ambiguous_text should be the actual text snippet from the document.
+Format: JSON array [{ambiguous_text, ambiguity_type, issue, evidence, suggested_query, severity, page}]
+- ambiguous_text should be the specific vague or unclear term/phrase identified (e.g., "reasonable timeframe").
+- evidence should be the full sentence or clause from the document containing the ambiguous text, as an exact quote.
 - suggested_query should be a formal question for the authority to clarify the point."""
         reduce_system = "You are consolidating ambiguity findings into a formal pre-bid query report."
         reduce_instruction = """Consolidate finding D: into a comprehensive Scrutiny Report. Refine the suggested_query for each finding.
-Format: JSON {ambiguities: [{ambiguous_text, ambiguity_type, issue, suggested_query, severity, pages:[], recommendation}], summary, overall_assessment: "Brief assessment."}"""
+Format: JSON {ambiguities: [{ambiguous_text, ambiguity_type, issue, evidence, suggested_query, severity, pages:[], recommendation}], summary, overall_assessment: "Brief assessment."}"""
     elif mode == "Overall Summary & Voice":
         map_system = "You are a senior analyst extracting high-density data for a 15-minute executive briefing."
         map_instruction = """Extract ALL critical information across these domains:
@@ -1225,6 +1226,9 @@ else:
                         with st.container():
                             st.markdown(f"**{idx+1}. {a.get('ambiguity_type', 'Ambiguity')}**")
                             st.write(f"**Issue:** {a.get('issue', 'N/A')}")
+                            if a.get('evidence'):
+                                ev = a['evidence']
+                                st.markdown(f"**Evidence:** *\"{ev}\"*")
                             st.warning(f"**Suggested Query:** {a.get('suggested_query', 'N/A')}")
                             if a.get('recommendation'): st.info(f"**Recommendation:** {a.get('recommendation')}")
                             st.caption(f"Ref: {a.get('ambiguous_text', 'Section')} | Severity: {a.get('severity', 'Medium')} | Pages: {a.get('pages', [])}")
