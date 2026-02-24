@@ -1285,10 +1285,16 @@ else:
 
             with export_tab:
                 df = convert_result_to_dataframe(r["result"], s_obj)
-                if df is not None:
+                excel_data = export_to_excel(df, r['query'], s_obj) if df is not None else None
+                word_data = export_to_word(df, r['query'], s_obj, result=r['result'])
+                if excel_data is not None or word_data is not None:
                     col1, col2 = st.columns(2)
-                    with col1: st.download_button("📥 Excel", export_to_excel(df, r['query'], s_obj), f"{sanitize_filename(r['query'])}.xlsx", use_container_width=True)
-                    with col2: st.download_button("📥 Word", export_to_word(df, r['query'], s_obj, result=r['result']), f"{sanitize_filename(r['query'])}.docx", use_container_width=True)
+                    with col1:
+                        if excel_data is not None:
+                            st.download_button("📥 Excel", excel_data, f"{sanitize_filename(r['query'])}.xlsx", use_container_width=True)
+                    with col2:
+                        if word_data is not None:
+                            st.download_button("📥 Word", word_data, f"{sanitize_filename(r['query'])}.docx", use_container_width=True)
                 st.subheader("Raw AI Output")
                 st.json(r["result"])
 
