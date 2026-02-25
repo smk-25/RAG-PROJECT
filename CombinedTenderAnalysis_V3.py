@@ -611,8 +611,9 @@ def clean_json_string(txt):
     txt = re.sub(r'\bTrue\b', 'true', txt)
     txt = re.sub(r'\bFalse\b', 'false', txt)
     txt = re.sub(r'\bNone\b', 'null', txt)
-    # Fix unquoted object keys (e.g. {key: "value"} -> {"key": "value"})
-    txt = re.sub(r'([{,])\s*([A-Za-z_][A-Za-z0-9_]*)\s*:', r'\1"\2":', txt)
+    # NOTE: Do NOT apply an unquoted-key regex here — it would corrupt evidence
+    # strings that contain ", word:" patterns (e.g. "Section 3, clause: bidder shall"),
+    # turning valid JSON into invalid JSON and causing all map results to be discarded.
     return txt
 
 async def call_gemini_json_sum_async(client, sys, user, model, rpm):
@@ -1244,6 +1245,23 @@ else:
                     
                     st.write(f"Reducing {len(mapped)} findings...")
                     red = await call_gemini_json_sum_async(client, rs, f"{ri}\nQ:{q}\nD:{json.dumps(mapped)}", s_model, s_rpm)
+                    # Fallback: if the reduce step returned an empty or missing matrix but the
+                    # map step did find items, build the matrix directly from the mapped items.
+                    # This prevents a blank result when the reduce model is overly strict about
+                    # evidence requirements and excludes all entries.
+                    if s_obj == "Compliance Matrix" and isinstance(red, dict) and "error" not in red and not red.get("matrix") and mapped:
+                        red["matrix"] = [
+                            {
+                                "item": m.get("item", ""),
+                                "detail": m.get("detail", ""),
+                                "evidence": m.get("evidence", ""),
+                                "category": m.get("category", "General"),
+                                "mandatory": bool(m.get("mandatory", False)),
+                                "pages": [m["page"]] if m.get("page") else []
+                            }
+                            for m in mapped
+                            if isinstance(m, dict) and "error" not in m and m.get("item")
+                        ]
                     # Post-process: recover missing evidence in Compliance Matrix from mapped items
                     if s_obj == "Compliance Matrix" and isinstance(red, dict) and "matrix" in red:
                         mapped_evidence_by_item = {}
