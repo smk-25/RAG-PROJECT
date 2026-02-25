@@ -607,6 +607,12 @@ def clean_json_string(txt):
             end = txt.rfind("]") if txt[start] == "[" else txt.rfind("}")
             if end > start: txt = txt[start:end+1]
     txt = re.sub(r',(\s*[}\]])', r'\1', txt)
+    # Replace Python literals with JSON equivalents
+    txt = re.sub(r'\bTrue\b', 'true', txt)
+    txt = re.sub(r'\bFalse\b', 'false', txt)
+    txt = re.sub(r'\bNone\b', 'null', txt)
+    # Fix unquoted object keys (e.g. {key: "value"} -> {"key": "value"})
+    txt = re.sub(r'([{,])\s*([A-Za-z_][A-Za-z0-9_]*)\s*:', r'\1"\2":', txt)
     return txt
 
 async def call_gemini_json_sum_async(client, sys, user, model, rpm):
@@ -668,7 +674,7 @@ def get_sum_prompts(mode: str):
         ri = "Generate structured risk assessment JSON."
     elif mode == "Entity Dashboard":
         s1 = "You are extracting named entities."
-        mi = "Extract Organizations, People, Dates, etc. in JSON array."
+        mi = "Extract Organizations, People, Locations, Dates, Deadlines, Financials, Contacts, Technicals in JSON array."
         s2 = "You are compiling an entity dashboard."
         ri = "Generate categorized entity JSON."
     elif mode == "Ambiguity Scrutiny":
@@ -720,7 +726,7 @@ CRITICAL: Preserve the exact 'evidence' text from each finding verbatim — do N
 Format: JSON {risks: [{clause, reason, evidence, risk_level, risk_type, impact, pages:[]}], risk_summary: {total_risks, critical_count, high_count, medium_count, low_count, by_type: {}}}"""
     elif mode == "Entity Dashboard":
         map_system = "You are extracting key entities and metadata."
-        map_instruction = """Extract Organizations, People, Locations, Dates, Financials, Technicals from the provided Context Data.
+        map_instruction = """Extract Organizations, People, Locations, Dates, Deadlines, Financials, Contacts, Technicals from the provided Context Data.
 Each chunk in the Context Data is separated by "---" and has a header line "ID:... P:..." followed by "Text: <content>".
 Format: JSON array [{category, entity, context, evidence, page}]
 - evidence: MANDATORY - copy the EXACT verbatim phrase/clause from the "Text:" section of the chunk (text after "Text:" up to the next "---") that contains the entity. Do NOT paraphrase or leave blank.
@@ -730,7 +736,7 @@ RULE: Every item in the output array MUST have a non-empty evidence field and a 
         reduce_instruction = """Consolidate finding D: into dashboard categories. Remove duplicates. Preserve evidence and page numbers for each entity.
 CRITICAL: Preserve the exact 'evidence' text from each finding verbatim — do NOT modify, summarize, or omit the evidence values. Every entity MUST have a non-empty evidence field — any entity lacking evidence is invalid and must be excluded.
 IMPORTANT: For each entity, collect all unique page numbers from the source findings into the 'pages' array. Do NOT leave pages empty.
-Format: JSON {dashboard: {Organizations:[{entity, context, evidence, pages:[]}], People:[{entity, context, evidence, pages:[]}], Locations:[{entity, context, evidence, pages:[]}], Dates:[{entity, context, evidence, pages:[]}], Financials:[{entity, context, evidence, pages:[]}], Technicals:[{entity, context, evidence, pages:[]}]}, entity_count: {}}"""
+Format: JSON {dashboard: {Organizations:[{entity, context, evidence, pages:[]}], People:[{entity, context, evidence, pages:[]}], Locations:[{entity, context, evidence, pages:[]}], Dates:[{entity, context, evidence, pages:[]}], Deadlines:[{entity, context, evidence, pages:[]}], Financials:[{entity, context, evidence, pages:[]}], Contacts:[{entity, context, evidence, pages:[]}], Technicals:[{entity, context, evidence, pages:[]}]}, entity_count: {}}"""
     elif mode == "Ambiguity Scrutiny":
         map_system = "You are an expert analyst identifying ambiguous, vague, or contradictory language in tender documents."
         map_instruction = """Extract instances of vague terms ("reasonable", "appropriate"), unclear requirements, contradictions between sections, and missing details from the provided Context Data.
