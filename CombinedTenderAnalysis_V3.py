@@ -696,13 +696,13 @@ def get_sum_prompts_full(mode: str):
         map_instruction = """Extract ALL compliance requirements from the provided Context Data.
 Rules: Identify must/shall, specific criteria, conditional clauses, page numbers.
 Format: JSON array [{item, detail, evidence, category, mandatory, page}]
-- evidence should be the exact quote from the document.
+- evidence: MANDATORY - copy the EXACT verbatim sentence or clause from the "Text:" field of the chunk that contains the requirement. Do NOT paraphrase, summarize, or leave this field blank. Copy the full sentence word-for-word.
 - page: use the P: value from the chunk header that contains the requirement.
-RULE: Every item in the output array MUST have a non-empty evidence field taken verbatim from the source Text and a valid page number from the chunk header."""
+RULE: Every item in the output array MUST have a non-empty evidence field (an exact verbatim copy from the Text) and a valid page number from the chunk header. Any item without a non-empty evidence field is INVALID and must be excluded from the output."""
         reduce_system = "You are consolidating compliance requirements into a unified matrix."
-        reduce_instruction = """Consolidate finding D: into a unique matrix. Remove duplicates, merge similar with all pages.
+        reduce_instruction = """Consolidate the findings in D: into a unique compliance matrix. When merging duplicate or similar requirements, always keep the first non-empty 'evidence' value exactly as-is.
 IMPORTANT: For each matrix item, collect and list all unique page numbers from the source findings in the 'pages' array.
-CRITICAL: Preserve the exact 'evidence' text from each finding verbatim — do NOT modify, summarize, or omit the evidence values. Every matrix item MUST have a non-empty evidence field.
+CRITICAL: The 'evidence' field MUST contain the exact verbatim text copied directly from the source finding's 'evidence' field. Do NOT rephrase, shorten, or generate new text for evidence. If multiple source findings cover the same requirement, use the evidence from the first matching finding. Every matrix item MUST have a non-empty evidence field — any item lacking evidence is invalid and must be excluded.
 Format: JSON {matrix: [{item, detail, evidence, category, mandatory, pages:[]}], total_requirements, summary: {mandatory_count, optional_count, categories: {}}}"""
     elif mode == "Risk Assessment":
         map_system = "You are a risk analyst identifying risks, liabilities, and concerns."
@@ -1211,6 +1211,19 @@ else:
                     
                     st.write(f"Reducing {len(mapped)} findings...")
                     red = await call_gemini_json_sum_async(client, rs, f"{ri}\nQ:{q}\nD:{json.dumps(mapped)}", s_model, s_rpm)
+                    # Post-process: recover missing evidence in Compliance Matrix from mapped items
+                    if s_obj == "Compliance Matrix" and isinstance(red, dict) and "matrix" in red:
+                        mapped_evidence = {}
+                        for m in mapped:
+                            if isinstance(m, dict) and m.get("item") and m.get("evidence"):
+                                mapped_evidence[m["item"].lower().strip()] = m["evidence"]
+                        for entry in red.get("matrix", []):
+                            if isinstance(entry, dict) and not entry.get("evidence"):
+                                item_key = entry.get("item", "").lower().strip()
+                                for mk, mv in mapped_evidence.items():
+                                    if item_key and (item_key in mk or mk in item_key):
+                                        entry["evidence"] = mv
+                                        break
                     res.append({"query":q, "result":red, "map_t":t_m-t0, "red_t":time.time()-t_m, "mapped":mapped, "total_t":time.time()-t0})
                 return res
             
@@ -1277,10 +1290,29 @@ else:
                             if a.get('evidence'):
                                 ev = a['evidence']
                                 st.markdown(f"**Evidence:** *\"{ev}\"*")
+                            else:
+                                st.warning("**Evidence:** Not captured")
                             st.warning(f"**Suggested Query:** {a.get('suggested_query', 'N/A')}")
                             if a.get('recommendation'): st.info(f"**Recommendation:** {a.get('recommendation')}")
                             st.caption(f"Ref: {a.get('ambiguous_text', 'Section')} | Severity: {a.get('severity', 'Medium')} | Pages: {a.get('pages', [])}")
                             st.markdown("---")
+                elif s_obj == "Compliance Matrix" and "matrix" in r["result"]:
+                    matrix_items = r["result"]["matrix"]
+                    for idx, item in enumerate(matrix_items):
+                        if not isinstance(item, dict): continue
+                        with st.container():
+                            mandatory_badge = "🔴 Mandatory" if item.get("mandatory") else "🟡 Optional"
+                            st.markdown(f"**{idx+1}. {item.get('item', 'Requirement')}** — {mandatory_badge} | Category: `{item.get('category', 'N/A')}`")
+                            st.write(f"**Detail:** {item.get('detail', 'N/A')}")
+                            if item.get('evidence'):
+                                st.markdown(f"**Evidence:** *\"{item['evidence']}\"*")
+                            else:
+                                st.warning("**Evidence:** Not captured")
+                            st.caption(f"Pages: {item.get('pages', [])}")
+                            st.markdown("---")
+                    matrix_summary = r["result"].get("summary")
+                    if matrix_summary:
+                        st.info(f"**Summary:** Mandatory: {matrix_summary.get('mandatory_count', 0)} | Optional: {matrix_summary.get('optional_count', 0)} | Total Requirements: {r['result'].get('total_requirements', 0)}")
                 else:
                     df = convert_result_to_dataframe(r["result"], s_obj)
                     if df is not None: st.dataframe(df, use_container_width=True)
