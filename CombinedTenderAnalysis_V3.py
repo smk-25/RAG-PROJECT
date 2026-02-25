@@ -704,12 +704,12 @@ def get_sum_prompts_full(mode: str):
 Rules: Identify must/shall, specific criteria, conditional clauses, page numbers.
 Each chunk in the Context Data is separated by "---" and has a header line "ID:... P:..." followed by "Text: <content>".
 Format: JSON array [{item, detail, evidence, category, mandatory, page}]
-- evidence: MANDATORY - copy the EXACT verbatim sentence or clause from the "Text:" section of the chunk (the text after "Text:" up to the next "---" separator) that contains the requirement. Do NOT paraphrase, summarize, or leave this field blank. Copy the full sentence word-for-word.
+- evidence: MANDATORY - copy the EXACT verbatim sentence or clause from the "Text:" section of the chunk (the text after "Text:" up to the next "---" separator) that contains the requirement. Do NOT paraphrase or summarize. Copy the full sentence word-for-word.
 - page: use the P: value from the chunk header (the "ID:... P:..." line) that contains the requirement.
-RULE: Every item in the output array MUST have a non-empty evidence field (an exact verbatim copy from the Text section) and a valid page number from the chunk header. Any item with an empty evidence field is INVALID and must be omitted."""
+RULE: Every item in the output array MUST have a valid page number from the chunk header. Always include the item even if verbatim evidence is unavailable — set evidence to an empty string rather than omitting the item."""
         reduce_system = "You are consolidating compliance requirements into a unified matrix."
         reduce_instruction = """Consolidate the findings in D: into a unique compliance matrix. Deduplicate similar requirements.
-CRITICAL: Preserve the exact 'evidence' text from each finding verbatim — do NOT modify, summarize, or omit the evidence values. Every matrix item MUST have a non-empty evidence field — any item lacking evidence is invalid and must be excluded.
+CRITICAL: Preserve the exact 'evidence' text from each finding verbatim — do NOT modify, summarize, or omit the evidence values. Include ALL matrix items from the source findings — do NOT exclude any item, even if its evidence field is empty.
 IMPORTANT: For each matrix item, collect and list all unique page numbers from the source findings in the 'pages' array. Do NOT leave pages empty.
 Format: JSON {matrix: [{item, detail, evidence, category, mandatory, pages:[]}], total_requirements, summary: {mandatory_count, optional_count, categories: {}}}"""
     elif mode == "Risk Assessment":
@@ -1245,11 +1245,18 @@ else:
                     
                     st.write(f"Reducing {len(mapped)} findings...")
                     red = await call_gemini_json_sum_async(client, rs, f"{ri}\nQ:{q}\nD:{json.dumps(mapped)}", s_model, s_rpm)
-                    # Fallback: if the reduce step returned an empty or missing matrix but the
-                    # map step did find items, build the matrix directly from the mapped items.
-                    # This prevents a blank result when the reduce model is overly strict about
-                    # evidence requirements and excludes all entries.
-                    if s_obj == "Compliance Matrix" and isinstance(red, dict) and "error" not in red and not red.get("matrix") and mapped:
+                    # Fallback: if the reduce step returned an empty/missing matrix, an error,
+                    # or a non-dict response but the map step did find items, build the matrix
+                    # directly from the mapped items.  This covers three failure modes:
+                    #  1. Reduce returned an API/parse error dict.
+                    #  2. Reduce returned a valid dict but with an empty or absent 'matrix' key.
+                    #  3. Reduce returned something that is not a dict at all.
+                    if s_obj == "Compliance Matrix" and mapped and (
+                        not isinstance(red, dict) or not red.get("matrix")
+                    ):
+                        if not isinstance(red, dict):
+                            red = {}
+                        red.pop("error", None)
                         red["matrix"] = [
                             {
                                 "item": m.get("item", ""),
