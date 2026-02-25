@@ -725,8 +725,8 @@ Format: JSON array [{category, entity, context, evidence, page}]
 RULE: Every item in the output array MUST have a non-empty evidence field and a valid page number using the P: value from the chunk header."""
         reduce_system = "You are compiling entities into a dashboard."
         reduce_instruction = """Consolidate finding D: into dashboard categories. Remove duplicates. Preserve evidence and page numbers for each entity.
-CRITICAL: Preserve the exact 'evidence' text from each finding verbatim — do NOT modify, summarize, or omit the evidence values.
-IMPORTANT: For each entity, collect all unique page numbers from the source findings into the 'pages' array.
+CRITICAL: Preserve the exact 'evidence' text from each finding verbatim — do NOT modify, summarize, or omit the evidence values. Every entity MUST have a non-empty evidence field — any entity lacking evidence is invalid and must be excluded.
+IMPORTANT: For each entity, collect all unique page numbers from the source findings into the 'pages' array. Do NOT leave pages empty.
 Format: JSON {dashboard: {Organizations:[{entity, context, evidence, pages:[]}], People:[{entity, context, evidence, pages:[]}], Locations:[{entity, context, evidence, pages:[]}], Dates:[{entity, context, evidence, pages:[]}], Financials:[{entity, context, evidence, pages:[]}], Technicals:[{entity, context, evidence, pages:[]}]}, entity_count: {}}"""
     elif mode == "Ambiguity Scrutiny":
         map_system = "You are an expert analyst identifying ambiguous, vague, or contradictory language in tender documents."
@@ -739,7 +739,8 @@ Format: JSON array [{ambiguous_text, ambiguity_type, issue, evidence, suggested_
 RULE: Every item in the output array MUST have a non-empty evidence field taken verbatim from the source Text and a valid page number from the chunk header."""
         reduce_system = "You are consolidating ambiguity findings into a formal pre-bid query report."
         reduce_instruction = """Consolidate finding D: into a comprehensive Scrutiny Report. Refine the suggested_query for each finding.
-CRITICAL: Preserve the exact 'evidence' text from each finding verbatim — do NOT modify, summarize, or omit the evidence values.
+CRITICAL: Preserve the exact 'evidence' text from each finding verbatim — do NOT modify, summarize, or omit the evidence values. Every ambiguity item MUST have a non-empty evidence field — any item lacking evidence is invalid and must be excluded.
+IMPORTANT: For each ambiguity, collect and list all unique page numbers from the source findings into the 'pages' array. Do NOT leave pages empty.
 Format: JSON {ambiguities: [{ambiguous_text, ambiguity_type, issue, evidence, suggested_query, severity, pages:[], recommendation}], summary, overall_assessment: "Brief assessment."}"""
     elif mode == "Overall Summary & Voice":
         map_system = "You are a senior analyst extracting high-density data for a 15-minute executive briefing."
@@ -817,6 +818,15 @@ def compute_confidence_score_sum(mapped, reduced, q):
                     if isinstance(item, dict):
                         c = item.get("pages") or item.get("page")
                         if c: cites.extend(c if isinstance(c, list) else [c])
+        # Extract citations from Entity Dashboard nested structure
+        dashboard = reduced.get("dashboard")
+        if isinstance(dashboard, dict):
+            for cat_items in dashboard.values():
+                if isinstance(cat_items, list):
+                    for item in cat_items:
+                        if isinstance(item, dict):
+                            c = item.get("pages") or item.get("page")
+                            if c: cites.extend(c if isinstance(c, list) else [c])
     unique_cites = len(set(c for c in cites if c is not None))
     expected = max(1, len(mapped) / 3)
     conf["citation_confidence"] = min(1.0, unique_cites / expected)
@@ -871,7 +881,7 @@ def convert_result_to_dataframe(result, objective):
                 if isinstance(items, list):
                     for it in items:
                         if isinstance(it, dict): it_c = it.copy(); it_c["category"] = cat; entities.append(it_c)
-            df = pd.DataFrame(entities) if entities else pd.DataFrame(columns=["category", "entity", "context", "pages"])
+            df = pd.DataFrame(entities) if entities else pd.DataFrame(columns=["category", "entity", "context", "evidence", "pages"])
         elif objective == "Ambiguity Scrutiny" and "ambiguities" in result: df = pd.DataFrame(result["ambiguities"])
         elif objective == "General Summary":
             for k in result.keys():
@@ -1277,16 +1287,105 @@ else:
                             for entry in items:
                                 if isinstance(entry, dict) and not entry.get("evidence"):
                                     ent_key = entry.get("entity", "").lower().strip()
+                                    # Strategy 1: substring match on entity name
                                     for ek, ev in mapped_evidence_by_entity.items():
                                         if ent_key and (ent_key in ek or ek in ent_key):
                                             entry["evidence"] = ev
                                             break
+                                    # Strategy 2: match on context field
                                     if not entry.get("evidence"):
                                         ctx_key = entry.get("context", "").lower().strip()[:80]
                                         for ck, cv in mapped_evidence_by_context.items():
                                             if ctx_key and len(ctx_key) > 10 and (ctx_key in ck or ck in ctx_key):
                                                 entry["evidence"] = cv
                                                 break
+                                    # Strategy 3: word-overlap fuzzy match on entity name
+                                    if not entry.get("evidence"):
+                                        ent_words = set(ent_key.split()) if ent_key else set()
+                                        best_ev, best_overlap = None, 0
+                                        for ek, ev in mapped_evidence_by_entity.items():
+                                            overlap = len(ent_words & set(ek.split()))
+                                            if overlap > best_overlap:
+                                                best_overlap = overlap
+                                                best_ev = ev
+                                        if best_ev and best_overlap >= 2:
+                                            entry["evidence"] = best_ev
+                    # Post-process: recover missing evidence in Risk Assessment from mapped items
+                    elif s_obj == "Risk Assessment" and isinstance(red, dict) and "risks" in red:
+                        mapped_evidence_by_clause = {}
+                        mapped_evidence_by_reason = {}
+                        for m in mapped:
+                            if isinstance(m, dict) and m.get("evidence"):
+                                if m.get("clause"):
+                                    mapped_evidence_by_clause[m["clause"].lower().strip()] = m["evidence"]
+                                if m.get("reason"):
+                                    rk = m["reason"].lower().strip()[:80]
+                                    if rk:
+                                        mapped_evidence_by_reason[rk] = m["evidence"]
+                        for entry in red.get("risks", []):
+                            if isinstance(entry, dict) and not entry.get("evidence"):
+                                clause_key = entry.get("clause", "").lower().strip()
+                                # Strategy 1: substring match on clause
+                                for ck, cv in mapped_evidence_by_clause.items():
+                                    if clause_key and (clause_key in ck or ck in clause_key):
+                                        entry["evidence"] = cv
+                                        break
+                                # Strategy 2: match on reason field
+                                if not entry.get("evidence"):
+                                    reason_key = entry.get("reason", "").lower().strip()[:80]
+                                    for rk, rv in mapped_evidence_by_reason.items():
+                                        if reason_key and len(reason_key) > 10 and (reason_key in rk or rk in reason_key):
+                                            entry["evidence"] = rv
+                                            break
+                                # Strategy 3: word-overlap fuzzy match on clause
+                                if not entry.get("evidence"):
+                                    clause_words = set(clause_key.split()) if clause_key else set()
+                                    best_ev, best_overlap = None, 0
+                                    for ck, cv in mapped_evidence_by_clause.items():
+                                        overlap = len(clause_words & set(ck.split()))
+                                        if overlap > best_overlap:
+                                            best_overlap = overlap
+                                            best_ev = cv
+                                    if best_ev and best_overlap >= 2:
+                                        entry["evidence"] = best_ev
+                    # Post-process: recover missing evidence in Ambiguity Scrutiny from mapped items
+                    elif s_obj == "Ambiguity Scrutiny" and isinstance(red, dict) and "ambiguities" in red:
+                        mapped_evidence_by_text = {}
+                        mapped_evidence_by_issue = {}
+                        for m in mapped:
+                            if isinstance(m, dict) and m.get("evidence"):
+                                if m.get("ambiguous_text"):
+                                    mapped_evidence_by_text[m["ambiguous_text"].lower().strip()] = m["evidence"]
+                                if m.get("issue"):
+                                    ik = m["issue"].lower().strip()[:80]
+                                    if ik:
+                                        mapped_evidence_by_issue[ik] = m["evidence"]
+                        for entry in red.get("ambiguities", []):
+                            if isinstance(entry, dict) and not entry.get("evidence"):
+                                text_key = entry.get("ambiguous_text", "").lower().strip()
+                                # Strategy 1: substring match on ambiguous_text
+                                for tk, tv in mapped_evidence_by_text.items():
+                                    if text_key and (text_key in tk or tk in text_key):
+                                        entry["evidence"] = tv
+                                        break
+                                # Strategy 2: match on issue field
+                                if not entry.get("evidence"):
+                                    issue_key = entry.get("issue", "").lower().strip()[:80]
+                                    for ik, iv in mapped_evidence_by_issue.items():
+                                        if issue_key and len(issue_key) > 10 and (issue_key in ik or ik in issue_key):
+                                            entry["evidence"] = iv
+                                            break
+                                # Strategy 3: word-overlap fuzzy match on ambiguous_text
+                                if not entry.get("evidence"):
+                                    text_words = set(text_key.split()) if text_key else set()
+                                    best_ev, best_overlap = None, 0
+                                    for tk, tv in mapped_evidence_by_text.items():
+                                        overlap = len(text_words & set(tk.split()))
+                                        if overlap > best_overlap:
+                                            best_overlap = overlap
+                                            best_ev = tv
+                                    if best_ev and best_overlap >= 2:
+                                        entry["evidence"] = best_ev
                     res.append({"query":q, "result":red, "map_t":t_m-t0, "red_t":time.time()-t_m, "mapped":mapped, "total_t":time.time()-t0})
                 return res
             
