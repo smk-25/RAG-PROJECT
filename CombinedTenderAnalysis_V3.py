@@ -698,7 +698,7 @@ Rules: Identify must/shall, specific criteria, conditional clauses, page numbers
 Format: JSON array [{item, detail, evidence, category, mandatory, page}]
 - evidence: MANDATORY - copy the EXACT verbatim sentence or clause from the "Text:" field of the chunk that contains the requirement. Do NOT paraphrase, summarize, or leave this field blank. Copy the full sentence word-for-word.
 - page: use the P: value from the chunk header that contains the requirement.
-RULE: Every item in the output array MUST have a non-empty evidence field (an exact verbatim copy from the Text) and a valid page number from the chunk header. Any item without a non-empty evidence field is INVALID and must be excluded from the output."""
+RULE: Every item in the output array MUST have a non-empty evidence field (an exact verbatim copy from the Text) and a valid page number from the chunk header."""
         reduce_system = "You are consolidating compliance requirements into a unified matrix."
         reduce_instruction = """Consolidate the findings in D: into a unique compliance matrix. When merging duplicate or similar requirements, always keep the first non-empty 'evidence' value exactly as-is.
 IMPORTANT: For each matrix item, collect and list all unique page numbers from the source findings in the 'pages' array.
