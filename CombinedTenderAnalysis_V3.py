@@ -719,13 +719,15 @@ Format: JSON {risks: [{clause, reason, evidence, risk_level, risk_type, impact, 
     elif mode == "Entity Dashboard":
         map_system = "You are extracting key entities and metadata."
         map_instruction = """Extract Organizations, People, Locations, Dates, Financials, Technicals from the provided Context Data.
-Format: JSON array [{category, entity, context, page}]
+Format: JSON array [{category, entity, context, evidence, page}]
+- evidence: MANDATORY - copy the EXACT verbatim phrase/clause from the "Text:" field that contains the entity. Do NOT paraphrase or leave blank.
 - page: use the P: value from the chunk header that contains the entity.
-RULE: Every item in the output array MUST have a valid page number using the P: value from the chunk header."""
+RULE: Every item in the output array MUST have a non-empty evidence field and a valid page number using the P: value from the chunk header."""
         reduce_system = "You are compiling entities into a dashboard."
-        reduce_instruction = """Consolidate finding D: into dashboard categories. Remove duplicates. Preserve the page number for each entity.
+        reduce_instruction = """Consolidate finding D: into dashboard categories. Remove duplicates. Preserve evidence and page numbers for each entity.
+CRITICAL: Preserve the exact 'evidence' text from each finding verbatim — do NOT modify, summarize, or omit the evidence values.
 IMPORTANT: For each entity, collect all unique page numbers from the source findings into the 'pages' array.
-Format: JSON {dashboard: {Organizations:[{entity, context, pages:[]}], People:[{entity, context, pages:[]}], Locations:[{entity, context, pages:[]}], Dates:[{entity, context, pages:[]}], Financials:[{entity, context, pages:[]}], Technicals:[{entity, context, pages:[]}]}, entity_count: {}}"""
+Format: JSON {dashboard: {Organizations:[{entity, context, evidence, pages:[]}], People:[{entity, context, evidence, pages:[]}], Locations:[{entity, context, evidence, pages:[]}], Dates:[{entity, context, evidence, pages:[]}], Financials:[{entity, context, evidence, pages:[]}], Technicals:[{entity, context, evidence, pages:[]}]}, entity_count: {}}"""
     elif mode == "Ambiguity Scrutiny":
         map_system = "You are an expert analyst identifying ambiguous, vague, or contradictory language in tender documents."
         map_instruction = """Extract instances of vague terms ("reasonable", "appropriate"), unclear requirements, contradictions between sections, and missing details from the provided Context Data.
@@ -1257,6 +1259,34 @@ else:
                                             best_ev = mv
                                     if best_ev and best_overlap >= 2:
                                         entry["evidence"] = best_ev
+                    # Post-process: recover missing evidence in Entity Dashboard from mapped items
+                    elif s_obj == "Entity Dashboard" and isinstance(red, dict) and "dashboard" in red:
+                        mapped_evidence_by_entity = {}
+                        mapped_evidence_by_context = {}
+                        for m in mapped:
+                            if isinstance(m, dict) and m.get("evidence"):
+                                if m.get("entity"):
+                                    mapped_evidence_by_entity[m["entity"].lower().strip()] = m["evidence"]
+                                if m.get("context"):
+                                    ck = m["context"].lower().strip()[:80]
+                                    if ck:
+                                        mapped_evidence_by_context[ck] = m["evidence"]
+                        for _, items in red.get("dashboard", {}).items():
+                            if not isinstance(items, list):
+                                continue
+                            for entry in items:
+                                if isinstance(entry, dict) and not entry.get("evidence"):
+                                    ent_key = entry.get("entity", "").lower().strip()
+                                    for ek, ev in mapped_evidence_by_entity.items():
+                                        if ent_key and (ent_key in ek or ek in ent_key):
+                                            entry["evidence"] = ev
+                                            break
+                                    if not entry.get("evidence"):
+                                        ctx_key = entry.get("context", "").lower().strip()[:80]
+                                        for ck, cv in mapped_evidence_by_context.items():
+                                            if ctx_key and len(ctx_key) > 10 and (ctx_key in ck or ck in ctx_key):
+                                                entry["evidence"] = cv
+                                                break
                     res.append({"query":q, "result":red, "map_t":t_m-t0, "red_t":time.time()-t_m, "mapped":mapped, "total_t":time.time()-t0})
                 return res
             
@@ -1294,7 +1324,17 @@ else:
                     for cat, items in dash.items():
                         if items and isinstance(items, list):
                             st.markdown(f"**{cat}** ({len(items)})")
-                            st.dataframe(pd.DataFrame(items), use_container_width=True)
+                            for idx, ent in enumerate(items):
+                                if not isinstance(ent, dict): continue
+                                with st.container():
+                                    st.markdown(f"**{idx+1}. {ent.get('entity', 'Entity')}**")
+                                    st.write(f"**Context:** {ent.get('context', 'N/A')}")
+                                    if ent.get('evidence'):
+                                        st.markdown(f"**Evidence:** *\"{ent['evidence']}\"*")
+                                    else:
+                                        st.warning("**Evidence:** Not captured")
+                                    st.caption(f"Pages: {ent.get('pages', [])}")
+                                    st.markdown("---")
                 elif s_obj == "Risk Assessment" and "risks" in r["result"]:
                     risks = r["result"]["risks"]
                     for idx, risk in enumerate(risks):
