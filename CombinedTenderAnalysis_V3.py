@@ -700,9 +700,9 @@ Format: JSON array [{item, detail, evidence, category, mandatory, page}]
 - page: use the P: value from the chunk header that contains the requirement.
 RULE: Every item in the output array MUST have a non-empty evidence field (an exact verbatim copy from the Text) and a valid page number from the chunk header."""
         reduce_system = "You are consolidating compliance requirements into a unified matrix."
-        reduce_instruction = """Consolidate the findings in D: into a unique compliance matrix. When merging duplicate or similar requirements, always keep the first non-empty 'evidence' value exactly as-is.
-IMPORTANT: For each matrix item, collect and list all unique page numbers from the source findings in the 'pages' array.
-CRITICAL: The 'evidence' field MUST contain the exact verbatim text copied directly from the source finding's 'evidence' field. Do NOT rephrase, shorten, or generate new text for evidence. If multiple source findings cover the same requirement, use the evidence from the first matching finding. Every matrix item MUST have a non-empty evidence field.
+        reduce_instruction = """Consolidate the findings in D: into a unique compliance matrix. Deduplicate similar requirements.
+CRITICAL: Preserve the exact 'evidence' text from each finding verbatim — do NOT modify, summarize, or omit the evidence values. Every matrix item MUST have a non-empty evidence field — any item lacking evidence is invalid and must be excluded.
+IMPORTANT: For each matrix item, collect and list all unique page numbers from the source findings in the 'pages' array. Do NOT leave pages empty.
 Format: JSON {matrix: [{item, detail, evidence, category, mandatory, pages:[]}], total_requirements, summary: {mandatory_count, optional_count, categories: {}}}"""
     elif mode == "Risk Assessment":
         map_system = "You are a risk analyst identifying risks, liabilities, and concerns."
@@ -1235,14 +1235,20 @@ else:
                     if s_obj == "Compliance Matrix" and isinstance(red, dict) and "matrix" in red:
                         mapped_evidence_by_item = {}
                         mapped_evidence_by_detail = {}
+                        mapped_fallback_by_item = {}  # fallback: use detail when evidence is missing
                         for m in mapped:
-                            if isinstance(m, dict) and m.get("evidence"):
-                                if m.get("item"):
-                                    mapped_evidence_by_item[m["item"].lower().strip()] = m["evidence"]
-                                if m.get("detail"):
-                                    dk = m["detail"].lower().strip()[:80]
-                                    if dk:
-                                        mapped_evidence_by_detail[dk] = m["evidence"]
+                            if isinstance(m, dict):
+                                ev = m.get("evidence") or ""
+                                if ev:
+                                    if m.get("item"):
+                                        mapped_evidence_by_item[m["item"].lower().strip()] = ev
+                                    if m.get("detail"):
+                                        dk = m["detail"].lower().strip()[:80]
+                                        if dk:
+                                            mapped_evidence_by_detail[dk] = ev
+                                elif m.get("detail") and m.get("item"):
+                                    # fallback: store detail text for last-resort recovery
+                                    mapped_fallback_by_item[m["item"].lower().strip()] = m["detail"]
                         for entry in red.get("matrix", []):
                             if isinstance(entry, dict) and not entry.get("evidence"):
                                 item_key = entry.get("item", "").lower().strip()
@@ -1269,6 +1275,18 @@ else:
                                             best_ev = mv
                                     if best_ev and best_overlap >= 2:
                                         entry["evidence"] = best_ev
+                                # Strategy 4: fallback to mapped item's detail text
+                                if not entry.get("evidence"):
+                                    for fk, fv in mapped_fallback_by_item.items():
+                                        if item_key and (item_key in fk or fk in item_key):
+                                            entry["evidence"] = fv
+                                            break
+                                    if not entry.get("evidence"):
+                                        item_words = set(item_key.split()) if item_key else set()
+                                        for fk, fv in mapped_fallback_by_item.items():
+                                            if len(item_words & set(fk.split())) >= 2:
+                                                entry["evidence"] = fv
+                                                break
                     # Post-process: recover missing evidence in Entity Dashboard from mapped items
                     elif s_obj == "Entity Dashboard" and isinstance(red, dict) and "dashboard" in red:
                         mapped_evidence_by_entity = {}
