@@ -695,10 +695,11 @@ def get_sum_prompts_full(mode: str):
         map_system = "You are a compliance requirements extractor analyzing tender documents. Extract specific, actionable requirements."
         map_instruction = """Extract ALL compliance requirements from the provided Context Data.
 Rules: Identify must/shall, specific criteria, conditional clauses, page numbers.
+Each chunk in the Context Data is separated by "---" and has a header line "ID:... P:..." followed by "Text: <content>".
 Format: JSON array [{item, detail, evidence, category, mandatory, page}]
-- evidence: MANDATORY - copy the EXACT verbatim sentence or clause from the "Text:" field of the chunk that contains the requirement. Do NOT paraphrase, summarize, or leave this field blank. Copy the full sentence word-for-word.
-- page: use the P: value from the chunk header that contains the requirement.
-RULE: Every item in the output array MUST have a non-empty evidence field (an exact verbatim copy from the Text) and a valid page number from the chunk header."""
+- evidence: MANDATORY - copy the EXACT verbatim sentence or clause from the "Text:" section of the chunk (the text after "Text:" up to the next "---" separator) that contains the requirement. Do NOT paraphrase, summarize, or leave this field blank. Copy the full sentence word-for-word.
+- page: use the P: value from the chunk header (the "ID:... P:..." line) that contains the requirement.
+RULE: Every item in the output array MUST have a non-empty evidence field (an exact verbatim copy from the Text section) and a valid page number from the chunk header. Any item with an empty evidence field is INVALID and must be omitted."""
         reduce_system = "You are consolidating compliance requirements into a unified matrix."
         reduce_instruction = """Consolidate the findings in D: into a unique compliance matrix. Deduplicate similar requirements.
 CRITICAL: Preserve the exact 'evidence' text from each finding verbatim — do NOT modify, summarize, or omit the evidence values. Every matrix item MUST have a non-empty evidence field — any item lacking evidence is invalid and must be excluded.
@@ -707,8 +708,9 @@ Format: JSON {matrix: [{item, detail, evidence, category, mandatory, pages:[]}],
     elif mode == "Risk Assessment":
         map_system = "You are a risk analyst identifying risks, liabilities, and concerns."
         map_instruction = """Extract ALL potential risks from the provided Context Data. Look for: Penalties, liabilities, tight deadlines, ambiguous clauses, legal exposure.
+Each chunk in the Context Data is separated by "---" and has a header line "ID:... P:..." followed by "Text: <content>".
 Format: JSON array [{clause, reason, evidence, risk_level, risk_type, impact, page}]
-- evidence should be the exact quote from the document.
+- evidence: MANDATORY - copy the EXACT verbatim sentence or clause from the "Text:" section of the chunk (text after "Text:" up to the next "---") that contains the risk. Do NOT paraphrase or leave blank.
 - page: use the P: value from the chunk header that contains the risk.
 RULE: Every item in the output array MUST have a non-empty evidence field and a valid page number from the chunk header."""
         reduce_system = "You are consolidating risk assessments."
@@ -719,8 +721,9 @@ Format: JSON {risks: [{clause, reason, evidence, risk_level, risk_type, impact, 
     elif mode == "Entity Dashboard":
         map_system = "You are extracting key entities and metadata."
         map_instruction = """Extract Organizations, People, Locations, Dates, Financials, Technicals from the provided Context Data.
+Each chunk in the Context Data is separated by "---" and has a header line "ID:... P:..." followed by "Text: <content>".
 Format: JSON array [{category, entity, context, evidence, page}]
-- evidence: MANDATORY - copy the EXACT verbatim phrase/clause from the "Text:" field that contains the entity. Do NOT paraphrase or leave blank.
+- evidence: MANDATORY - copy the EXACT verbatim phrase/clause from the "Text:" section of the chunk (text after "Text:" up to the next "---") that contains the entity. Do NOT paraphrase or leave blank.
 - page: use the P: value from the chunk header that contains the entity.
 RULE: Every item in the output array MUST have a non-empty evidence field and a valid page number using the P: value from the chunk header."""
         reduce_system = "You are compiling entities into a dashboard."
@@ -731,9 +734,10 @@ Format: JSON {dashboard: {Organizations:[{entity, context, evidence, pages:[]}],
     elif mode == "Ambiguity Scrutiny":
         map_system = "You are an expert analyst identifying ambiguous, vague, or contradictory language in tender documents."
         map_instruction = """Extract instances of vague terms ("reasonable", "appropriate"), unclear requirements, contradictions between sections, and missing details from the provided Context Data.
+Each chunk in the Context Data is separated by "---" and has a header line "ID:... P:..." followed by "Text: <content>".
 Format: JSON array [{ambiguous_text, ambiguity_type, issue, evidence, suggested_query, severity, page}]
 - ambiguous_text: the specific vague or unclear term/phrase identified (e.g., "reasonable timeframe").
-- evidence: MANDATORY - copy the EXACT verbatim sentence or clause from the Text: field of the chunk that contains the ambiguous text. Do NOT paraphrase, summarize, or leave this blank.
+- evidence: MANDATORY - copy the EXACT verbatim sentence or clause from the "Text:" section of the chunk (text after "Text:" up to the next "---") that contains the ambiguous text. Do NOT paraphrase, summarize, or leave this blank.
 - suggested_query: a formal question for the authority to clarify the point.
 - page: use the P: value from the chunk header that contains the ambiguous text.
 RULE: Every item in the output array MUST have a non-empty evidence field taken verbatim from the source Text and a valid page number from the chunk header."""
@@ -750,7 +754,9 @@ Format: JSON {ambiguities: [{ambiguous_text, ambiguity_type, issue, evidence, su
 3. Financials (Budget, Penalties, Payment Terms)
 4. Technical Features (Mechanical, Electrical, Automation)
 5. Legal & Liability
+Each chunk in the Context Data is separated by "---" and has a header line "ID:... P:..." followed by "Text: <content>".
 Format: JSON array [{domain, topic, detail, evidence, importance, page}]
+- evidence: MANDATORY - copy the EXACT verbatim sentence from the "Text:" section of the chunk (text after "Text:" up to the next "---"). Do NOT paraphrase or leave blank.
 - page: use the P: value from the chunk header that contains the information.
 RULE: Every item in the output array MUST have a non-empty evidence field and a valid page number from the chunk header."""
         reduce_system = "You are a briefing expert synthesizing a massive, detailed tender overview."
@@ -769,6 +775,7 @@ Format: JSON {summary: "500+ words overview", key_findings: [{finding, detail, d
     else:
         map_system = "You are extracting key findings from tender documents."
         map_instruction = """Extract topics, critical requirements, facts, figures from the provided Context Data.
+Each chunk in the Context Data is separated by "---" and has a header line "ID:... P:..." followed by "Text: <content>".
 Format: JSON array [{finding, detail, type, importance, page}]
 - page: use the P: value from the chunk header that contains the finding.
 RULE: Every item in the output array MUST have a valid page number from the chunk header."""
@@ -1213,7 +1220,7 @@ else:
                     m_tasks = []
                     for b in batches:
                         # Prepend ID and Page to each chunk's text for better model attribution
-                        chunk_payload = "\n".join([f"ID:{c['id']} P:{c['start_page']} Text:{c['text']}" for c in b])
+                        chunk_payload = "\n\n".join([f"---\nID:{c['id']} P:{c['start_page']}\nText: {c['text']}" for c in b])
                         m_tasks.append(call_gemini_json_sum_async(client, ms, f"{mi}\nQ:{q}\nContext Data:\n{chunk_payload}", s_model, s_rpm))
                     mapped_batches = await asyncio.gather(*m_tasks); t_m = time.time()
                     mapped = []
@@ -1226,7 +1233,7 @@ else:
                             inner_list = next((b[k] for k in b if isinstance(b[k], list)), None)
                             if inner_list is not None:
                                 mapped.extend([item for item in inner_list if isinstance(item, dict) and "error" not in item])
-                            else:
+                            elif b:  # Only append non-empty dicts that have no inner list
                                 mapped.append(b)
                     
                     st.write(f"Reducing {len(mapped)} findings...")
@@ -1287,6 +1294,26 @@ else:
                                             if len(item_words & set(fk.split())) >= 2:
                                                 entry["evidence"] = fv
                                                 break
+                                # Strategy 5: search original chunk texts as last resort
+                                if not entry.get("evidence") and chunks:
+                                    stop_words = {"the", "a", "an", "of", "in", "to", "for", "and", "or", "is", "are", "will", "shall", "be", "at", "by"}
+                                    search_words = (set(item_key.split()) | set(entry.get("detail", "").lower().split())) - stop_words
+                                    search_words = {w for w in search_words if len(w) > 3}
+                                    best_chunk, best_score = None, 0
+                                    for chunk in chunks:
+                                        chunk_lower = chunk["text"].lower()
+                                        score = sum(1 for w in search_words if w in chunk_lower)
+                                        if score > best_score:
+                                            best_score = score
+                                            best_chunk = chunk
+                                    if best_chunk and best_score >= 2:
+                                        try:
+                                            sents = simple_sent_tokenize_shared(best_chunk["text"])
+                                            best_sent = max(sents, key=lambda s: sum(1 for w in search_words if w in s.lower()), default="")
+                                            if best_sent and best_sent.strip():
+                                                entry["evidence"] = best_sent.strip()
+                                        except Exception:
+                                            pass
                     # Post-process: recover missing evidence in Entity Dashboard from mapped items
                     elif s_obj == "Entity Dashboard" and isinstance(red, dict) and "dashboard" in red:
                         mapped_evidence_by_entity = {}
@@ -1328,6 +1355,25 @@ else:
                                                 best_ev = ev
                                         if best_ev and best_overlap >= 2:
                                             entry["evidence"] = best_ev
+                                    # Strategy 4: search original chunk texts as last resort
+                                    if not entry.get("evidence") and chunks:
+                                        stop_words = {"the", "a", "an", "of", "in", "to", "for", "and", "or", "is", "are"}
+                                        search_words = {w for w in ent_key.split() if len(w) > 3 and w not in stop_words}
+                                        best_chunk, best_score = None, 0
+                                        for chunk in chunks:
+                                            chunk_lower = chunk["text"].lower()
+                                            score = sum(1 for w in search_words if w in chunk_lower)
+                                            if score > best_score:
+                                                best_score = score
+                                                best_chunk = chunk
+                                        if best_chunk and best_score >= 1:
+                                            try:
+                                                sents = simple_sent_tokenize_shared(best_chunk["text"])
+                                                best_sent = max(sents, key=lambda s: sum(1 for w in search_words if w in s.lower()), default="")
+                                                if best_sent and best_sent.strip():
+                                                    entry["evidence"] = best_sent.strip()
+                                            except Exception:
+                                                pass
                     # Post-process: recover missing evidence in Risk Assessment from mapped items
                     elif s_obj == "Risk Assessment" and isinstance(red, dict) and "risks" in red:
                         mapped_evidence_by_clause = {}
@@ -1366,6 +1412,26 @@ else:
                                             best_ev = cv
                                     if best_ev and best_overlap >= 2:
                                         entry["evidence"] = best_ev
+                                # Strategy 4: search original chunk texts as last resort
+                                if not entry.get("evidence") and chunks:
+                                    stop_words = {"the", "a", "an", "of", "in", "to", "for", "and", "or", "is", "are", "will", "shall", "be"}
+                                    search_words = (set(clause_key.split()) | set(entry.get("reason", "").lower().split())) - stop_words
+                                    search_words = {w for w in search_words if len(w) > 3}
+                                    best_chunk, best_score = None, 0
+                                    for chunk in chunks:
+                                        chunk_lower = chunk["text"].lower()
+                                        score = sum(1 for w in search_words if w in chunk_lower)
+                                        if score > best_score:
+                                            best_score = score
+                                            best_chunk = chunk
+                                    if best_chunk and best_score >= 2:
+                                        try:
+                                            sents = simple_sent_tokenize_shared(best_chunk["text"])
+                                            best_sent = max(sents, key=lambda s: sum(1 for w in search_words if w in s.lower()), default="")
+                                            if best_sent and best_sent.strip():
+                                                entry["evidence"] = best_sent.strip()
+                                        except Exception:
+                                            pass
                     # Post-process: recover missing evidence in Ambiguity Scrutiny from mapped items
                     elif s_obj == "Ambiguity Scrutiny" and isinstance(red, dict) and "ambiguities" in red:
                         mapped_evidence_by_text = {}
@@ -1404,7 +1470,27 @@ else:
                                             best_ev = tv
                                     if best_ev and best_overlap >= 2:
                                         entry["evidence"] = best_ev
-                    res.append({"query":q, "result":red, "map_t":t_m-t0, "red_t":time.time()-t_m, "mapped":mapped, "total_t":time.time()-t0})
+                                # Strategy 4: search original chunk texts as last resort
+                                if not entry.get("evidence") and chunks:
+                                    stop_words = {"the", "a", "an", "of", "in", "to", "for", "and", "or", "is", "are"}
+                                    search_words = (set(text_key.split()) | set(entry.get("issue", "").lower().split())) - stop_words
+                                    search_words = {w for w in search_words if len(w) > 3}
+                                    best_chunk, best_score = None, 0
+                                    for chunk in chunks:
+                                        chunk_lower = chunk["text"].lower()
+                                        score = sum(1 for w in search_words if w in chunk_lower)
+                                        if score > best_score:
+                                            best_score = score
+                                            best_chunk = chunk
+                                    if best_chunk and best_score >= 2:
+                                        try:
+                                            sents = simple_sent_tokenize_shared(best_chunk["text"])
+                                            best_sent = max(sents, key=lambda s: sum(1 for w in search_words if w in s.lower()), default="")
+                                            if best_sent and best_sent.strip():
+                                                entry["evidence"] = best_sent.strip()
+                                        except Exception:
+                                            pass
+                    res.append({"query":q, "result":red, "map_t":t_m-t0, "red_t":time.time()-t_m, "mapped":mapped, "total_t":time.time()-t0, "chunk_count": len(chunks)})
                 return res
             
             final_res = asyncio.run(run_sum_v2())
@@ -1415,7 +1501,7 @@ else:
             if isinstance(r["result"], dict) and "error" in r["result"]: st.error(r["result"]["error"]); continue
             
             conf = compute_confidence_score_sum(r['mapped'], r['result'], r['query'])
-            render_metric_cards(len(r['mapped']), r['total_t'], conf['overall_confidence'])
+            render_metric_cards(r.get('chunk_count', len(r['mapped'])), r['total_t'], conf['overall_confidence'])
             
             # Action Tabs for V2
             tabs_list = ["📊 Data Visualization", "🖼️ Context Preview", "📥 Export & Raw"]
