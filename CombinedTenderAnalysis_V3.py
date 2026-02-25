@@ -1206,24 +1206,57 @@ else:
                     mapped_batches = await asyncio.gather(*m_tasks); t_m = time.time()
                     mapped = []
                     for b in mapped_batches:
-                        if isinstance(b, list): mapped.extend([item for item in b if isinstance(item, dict) and "error" not in item])
-                        elif isinstance(b, dict) and "error" not in b: mapped.append(b)
+                        if isinstance(b, list):
+                            mapped.extend([item for item in b if isinstance(item, dict) and "error" not in item])
+                        elif isinstance(b, dict) and "error" not in b:
+                            # Try to unwrap if the LLM returned a dict with a list inside
+                            # (e.g. {"requirements": [...]} or {"items": [...]})
+                            inner_list = next((b[k] for k in b if isinstance(b[k], list)), None)
+                            if inner_list is not None:
+                                mapped.extend([item for item in inner_list if isinstance(item, dict) and "error" not in item])
+                            else:
+                                mapped.append(b)
                     
                     st.write(f"Reducing {len(mapped)} findings...")
                     red = await call_gemini_json_sum_async(client, rs, f"{ri}\nQ:{q}\nD:{json.dumps(mapped)}", s_model, s_rpm)
                     # Post-process: recover missing evidence in Compliance Matrix from mapped items
                     if s_obj == "Compliance Matrix" and isinstance(red, dict) and "matrix" in red:
-                        mapped_evidence = {}
+                        mapped_evidence_by_item = {}
+                        mapped_evidence_by_detail = {}
                         for m in mapped:
-                            if isinstance(m, dict) and m.get("item") and m.get("evidence"):
-                                mapped_evidence[m["item"].lower().strip()] = m["evidence"]
+                            if isinstance(m, dict) and m.get("evidence"):
+                                if m.get("item"):
+                                    mapped_evidence_by_item[m["item"].lower().strip()] = m["evidence"]
+                                if m.get("detail"):
+                                    dk = m["detail"].lower().strip()[:80]
+                                    if dk:
+                                        mapped_evidence_by_detail[dk] = m["evidence"]
                         for entry in red.get("matrix", []):
                             if isinstance(entry, dict) and not entry.get("evidence"):
                                 item_key = entry.get("item", "").lower().strip()
-                                for mk, mv in mapped_evidence.items():
+                                # Strategy 1: substring match on item name
+                                for mk, mv in mapped_evidence_by_item.items():
                                     if item_key and (item_key in mk or mk in item_key):
                                         entry["evidence"] = mv
                                         break
+                                # Strategy 2: match on detail field
+                                if not entry.get("evidence"):
+                                    detail_key = entry.get("detail", "").lower().strip()[:80]
+                                    for dk, dv in mapped_evidence_by_detail.items():
+                                        if detail_key and len(detail_key) > 10 and (detail_key in dk or dk in detail_key):
+                                            entry["evidence"] = dv
+                                            break
+                                # Strategy 3: word-overlap fuzzy match on item name
+                                if not entry.get("evidence"):
+                                    item_words = set(item_key.split()) if item_key else set()
+                                    best_ev, best_overlap = None, 0
+                                    for mk, mv in mapped_evidence_by_item.items():
+                                        overlap = len(item_words & set(mk.split()))
+                                        if overlap > best_overlap:
+                                            best_overlap = overlap
+                                            best_ev = mv
+                                    if best_ev and best_overlap >= 2:
+                                        entry["evidence"] = best_ev
                     res.append({"query":q, "result":red, "map_t":t_m-t0, "red_t":time.time()-t_m, "mapped":mapped, "total_t":time.time()-t0})
                 return res
             
