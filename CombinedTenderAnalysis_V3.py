@@ -744,13 +744,13 @@ Format: JSON {dashboard: {Organizations:[{entity, context, evidence, pages:[]}],
 Each chunk in the Context Data is separated by "---" and has a header line "ID:... P:..." followed by "Text: <content>".
 Format: JSON array [{ambiguous_text, ambiguity_type, issue, evidence, suggested_query, severity, page}]
 - ambiguous_text: the specific vague or unclear term/phrase identified (e.g., "reasonable timeframe").
-- evidence: MANDATORY - copy the EXACT verbatim sentence or clause from the "Text:" section of the chunk (text after "Text:" up to the next "---") that contains the ambiguous text. Do NOT paraphrase, summarize, or leave this blank.
+- evidence: copy the EXACT verbatim sentence or clause from the "Text:" section of the chunk (text after "Text:" up to the next "---") that contains the ambiguous text. If no clear verbatim sentence can be extracted, set this field to an empty string "".
 - suggested_query: a formal question for the authority to clarify the point.
 - page: use the P: value from the chunk header that contains the ambiguous text.
-RULE: Every item in the output array MUST have a non-empty evidence field taken verbatim from the source Text and a valid page number from the chunk header."""
+RULE: Include every ambiguity found in the text. Do not omit any ambiguity, even if direct evidence cannot be extracted verbatim — set evidence to "" in that case rather than omitting the item. Every item must have a valid page number from the chunk header."""
         reduce_system = "You are consolidating ambiguity findings into a formal pre-bid query report."
         reduce_instruction = """Consolidate finding D: into a comprehensive Scrutiny Report. Refine the suggested_query for each finding.
-CRITICAL: Preserve the exact 'evidence' text from each finding verbatim — do NOT modify, summarize, or omit the evidence values. Every ambiguity item MUST have a non-empty evidence field — any item lacking evidence is invalid and must be excluded.
+CRITICAL: Preserve the exact 'evidence' text from each finding verbatim — do NOT modify, summarize, or omit the evidence values.
 IMPORTANT: For each ambiguity, collect and list all unique page numbers from the source findings into the 'pages' array. Do NOT leave pages empty.
 Format: JSON {ambiguities: [{ambiguous_text, ambiguity_type, issue, evidence, suggested_query, severity, pages:[], recommendation}], summary, overall_assessment: "Brief assessment."}"""
     elif mode == "Overall Summary & Voice":
@@ -1354,6 +1354,21 @@ else:
                             if "page" in item and "pages" not in item:
                                 item["pages"] = [item["page"]]
                         red["risks"] = fallback_risks
+                    # Fallback: if the reduce step returned an empty/missing ambiguities list, an error,
+                    # or a non-dict response but the map step did find items, build the ambiguities list
+                    # directly from the mapped items.
+                    if s_obj == "Ambiguity Scrutiny" and mapped and (
+                        not isinstance(red, dict) or not red.get("ambiguities")
+                    ):
+                        if not isinstance(red, dict):
+                            red = {}
+                        red.pop("error", None)
+                        fallback_ambiguities = [m for m in mapped if isinstance(m, dict) and not m.get("error")]
+                        # Normalize page (singular) → pages (array) for display consistency
+                        for item in fallback_ambiguities:
+                            if "page" in item and "pages" not in item:
+                                item["pages"] = [item["page"]]
+                        red["ambiguities"] = fallback_ambiguities
                     # Normalize reduce-step matrix items to canonical key names so
                     # downstream display code always sees 'item', 'detail', 'mandatory', etc.
                     if s_obj == "Compliance Matrix" and isinstance(red, dict) and red.get("matrix"):
