@@ -704,9 +704,9 @@ def get_sum_prompts_full(mode: str):
 Rules: Identify must/shall, specific criteria, conditional clauses, page numbers.
 Each chunk in the Context Data is separated by "---" and has a header line "ID:... P:..." followed by "Text: <content>".
 Format: JSON array [{item, detail, evidence, category, mandatory, page}]
-- evidence: MANDATORY - copy the EXACT verbatim sentence or clause from the "Text:" section of the chunk (the text after "Text:" up to the next "---" separator) that contains the requirement. Do NOT paraphrase or summarize. Copy the full sentence word-for-word.
+- evidence: copy the relevant sentence or clause from the "Text:" section of the chunk (the text after "Text:" up to the next "---" separator) that contains the requirement. If no clear evidence sentence is found, set this field to an empty string "".
 - page: use the P: value from the chunk header (the "ID:... P:..." line) that contains the requirement.
-RULE: Every item in the output array MUST have a valid page number from the chunk header. Always include the item even if verbatim evidence is unavailable — set evidence to an empty string rather than omitting the item."""
+Rule: Include every compliance requirement found in the text. Do not omit any requirement, even if evidence is unavailable -- set evidence to "" in that case. Every item must have a valid page number from the chunk header."""
         reduce_system = "You are consolidating compliance requirements into a unified matrix."
         reduce_instruction = """Consolidate the findings in D: into a unique compliance matrix. Deduplicate similar requirements.
 CRITICAL: Preserve the exact 'evidence' text from each finding verbatim — do NOT modify, summarize, or omit the evidence values. Include ALL matrix items from the source findings — do NOT exclude any item, even if its evidence field is empty.
@@ -1243,6 +1243,27 @@ else:
                             elif b:  # Only append non-empty dicts that have no inner list
                                 mapped.append(b)
                     
+                    # Recovery: if all map batches returned no items (e.g. all failed or LLM
+                    # returned empty arrays), attempt a single direct extraction on the first
+                    # batch of chunks before giving up and sending an empty D: to the reduce step.
+                    if not mapped and chunks:
+                        st.write("Map phase yielded no findings -- attempting recovery extraction...")
+                        recovery_payload = "\n\n".join(
+                            f"---\nID:{c['id']} P:{c['start_page']}\nText: {c['text']}"
+                            for c in chunks[:s_batch]
+                        )
+                        recovery_result = await call_gemini_json_sum_async(
+                            client, ms,
+                            f"{mi}\nQ:{q}\nContext Data:\n{recovery_payload}",
+                            s_model, s_rpm
+                        )
+                        if isinstance(recovery_result, list):
+                            mapped = [item for item in recovery_result if isinstance(item, dict) and "error" not in item]
+                        elif isinstance(recovery_result, dict) and "error" not in recovery_result:
+                            inner = next((recovery_result[k] for k in recovery_result if isinstance(recovery_result[k], list)), None)
+                            if inner:
+                                mapped = [item for item in inner if isinstance(item, dict) and "error" not in item]
+
                     st.write(f"Reducing {len(mapped)} findings...")
                     red = await call_gemini_json_sum_async(client, rs, f"{ri}\nQ:{q}\nD:{json.dumps(mapped)}", s_model, s_rpm)
                     # Fallback: if the reduce step returned an empty/missing matrix, an error,
