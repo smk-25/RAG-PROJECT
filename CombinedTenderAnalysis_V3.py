@@ -791,6 +791,61 @@ RULE: Every item in the output array MUST have a valid page number from the chun
 Format: JSON {summary: "2-3 paragraphs", key_findings: [{finding, detail, importance, pages:[]}], citations: [], finding_stats: {}}"""
     return (map_system, map_instruction, reduce_system, reduce_instruction)
 
+# Maximum character length used when truncating a detail string to produce a fallback item label.
+_MAX_FALLBACK_ITEM_LENGTH = 80
+
+def _resolve_mandatory_val(val) -> bool:
+    """Normalise various LLM representations of mandatory/optional to a bool.
+
+    The LLM may return booleans, strings such as 'true'/'yes'/'mandatory',
+    or integers.  All are accepted.
+    """
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        return val.strip().lower() in ("true", "yes", "mandatory", "must", "shall", "1", "required")
+    if isinstance(val, (int, float)):
+        return bool(val)
+    return False
+
+def _normalize_compliance_item(entry: dict) -> dict | None:
+    """Return a canonical compliance-matrix dict from a raw LLM output entry.
+
+    Accepts any of the common key variants the LLM might emit
+    (e.g. 'requirement' instead of 'item', 'description' instead of
+    'detail', a string 'true' for mandatory, etc.).
+    Returns None when the entry has no usable text at all.
+    """
+    if not isinstance(entry, dict) or "error" in entry:
+        return None
+    item_text = (
+        entry.get("item") or entry.get("requirement") or entry.get("compliance_item")
+        or entry.get("name") or entry.get("clause") or entry.get("topic")
+        or entry.get("requirement_name") or ""
+    ).strip()
+    detail_text = (
+        entry.get("detail") or entry.get("description") or entry.get("details")
+        or entry.get("specifics") or entry.get("content") or ""
+    ).strip()
+    if not item_text and not detail_text:
+        return None
+    mandatory_raw = (
+        entry.get("mandatory") if entry.get("mandatory") is not None
+        else entry.get("type") or entry.get("requirement_type") or False
+    )
+    return {
+        "item": item_text or detail_text[:_MAX_FALLBACK_ITEM_LENGTH],
+        "detail": detail_text,
+        "evidence": entry.get("evidence", ""),
+        "category": entry.get("category") or entry.get("type") or "General",
+        "mandatory": _resolve_mandatory_val(mandatory_raw),
+        "pages": (
+            entry.get("pages") if isinstance(entry.get("pages"), list)
+            else ([entry["page"]] if entry.get("page") else [])
+        ),
+    }
+
+
 def compute_confidence_score_sum(mapped, reduced, q):
     conf = {"snippet_coverage": 0.0, "result_coherence": 0.0, "information_density": 0.0, "citation_confidence": 0.0, "overall_confidence": 0.0}
     if not mapped: return conf
@@ -1279,16 +1334,13 @@ else:
                             red = {}
                         red.pop("error", None)
                         red["matrix"] = [
-                            {
-                                "item": m.get("item", ""),
-                                "detail": m.get("detail", ""),
-                                "evidence": m.get("evidence", ""),
-                                "category": m.get("category", "General"),
-                                "mandatory": bool(m.get("mandatory", False)),
-                                "pages": [m["page"]] if m.get("page") else []
-                            }
-                            for m in mapped
-                            if isinstance(m, dict) and "error" not in m and m.get("item")
+                            n for n in (_normalize_compliance_item(m) for m in mapped) if n is not None
+                        ]
+                    # Normalize reduce-step matrix items to canonical key names so
+                    # downstream display code always sees 'item', 'detail', 'mandatory', etc.
+                    if s_obj == "Compliance Matrix" and isinstance(red, dict) and red.get("matrix"):
+                        red["matrix"] = [
+                            n for n in (_normalize_compliance_item(e) for e in red["matrix"]) if n is not None
                         ]
                     # Post-process: recover missing evidence in Compliance Matrix from mapped items
                     if s_obj == "Compliance Matrix" and isinstance(red, dict) and "matrix" in red:
@@ -1629,7 +1681,7 @@ else:
                     for idx, item in enumerate(matrix_items):
                         if not isinstance(item, dict): continue
                         with st.container():
-                            mandatory_badge = "🔴 Mandatory" if item.get("mandatory") else "🟡 Optional"
+                            mandatory_badge = "🔴 Mandatory" if _resolve_mandatory_val(item.get("mandatory")) else "🟡 Optional"
                             st.markdown(f"**{idx+1}. {item.get('item', 'Requirement')}** — {mandatory_badge} | Category: `{item.get('category', 'N/A')}`")
                             st.write(f"**Detail:** {item.get('detail', 'N/A')}")
                             if item.get('evidence'):
@@ -1640,7 +1692,7 @@ else:
                             st.markdown("---")
                     valid_items = [item for item in matrix_items if isinstance(item, dict)]
                     total_reqs = len(valid_items)
-                    mandatory_count = sum(1 for item in valid_items if item.get("mandatory"))
+                    mandatory_count = sum(1 for item in valid_items if _resolve_mandatory_val(item.get("mandatory")))
                     optional_count = total_reqs - mandatory_count
                     st.info(f"**Summary:** Mandatory: {mandatory_count} | Optional: {optional_count} | Total Requirements: {total_reqs}")
                 else:
