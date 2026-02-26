@@ -717,9 +717,9 @@ Format: JSON {matrix: [{item, detail, evidence, category, mandatory, pages:[]}],
         map_instruction = """Extract ALL potential risks from the provided Context Data. Look for: Penalties, liabilities, tight deadlines, ambiguous clauses, legal exposure.
 Each chunk in the Context Data is separated by "---" and has a header line "ID:... P:..." followed by "Text: <content>".
 Format: JSON array [{clause, reason, evidence, risk_level, risk_type, impact, page}]
-- evidence: MANDATORY - copy the EXACT verbatim sentence or clause from the "Text:" section of the chunk (text after "Text:" up to the next "---") that contains the risk. Do NOT paraphrase or leave blank.
+- evidence: copy the relevant sentence or clause from the "Text:" section of the chunk (the text after "Text:" up to the next "---" separator) that contains the risk. If no clear verbatim sentence can be extracted, set this field to an empty string "".
 - page: use the P: value from the chunk header that contains the risk.
-RULE: Every item in the output array MUST have a non-empty evidence field and a valid page number from the chunk header."""
+RULE: Include every risk found in the text. Do not omit any risk, even if direct evidence cannot be extracted verbatim — set evidence to "" in that case rather than omitting the item. Every item must have a valid page number from the chunk header."""
         reduce_system = "You are consolidating risk assessments."
         reduce_instruction = """Consolidate finding D: into unique risks. Prioritize High/Critical.
 IMPORTANT: For each risk item, collect and list all unique page numbers from the source findings into the 'pages' array. Do NOT leave pages empty.
@@ -1287,14 +1287,17 @@ else:
                     mapped_batches = await asyncio.gather(*m_tasks); t_m = time.time()
                     mapped = []
                     for b in mapped_batches:
+                        if b is None:
+                            # json.loads("null") returns None if Gemini returns a JSON null response
+                            continue
                         if isinstance(b, list):
-                            mapped.extend([item for item in b if isinstance(item, dict) and "error" not in item])
-                        elif isinstance(b, dict) and "error" not in b:
+                            mapped.extend([item for item in b if isinstance(item, dict) and not item.get("error")])
+                        elif isinstance(b, dict) and not b.get("error"):
                             # Try to unwrap if the LLM returned a dict with a list inside
                             # (e.g. {"requirements": [...]} or {"items": [...]})
                             inner_list = next((b[k] for k in b if isinstance(b[k], list)), None)
                             if inner_list is not None:
-                                mapped.extend([item for item in inner_list if isinstance(item, dict) and "error" not in item])
+                                mapped.extend([item for item in inner_list if isinstance(item, dict) and not item.get("error")])
                             elif b:  # Only append non-empty dicts that have no inner list
                                 mapped.append(b)
                     
@@ -1313,11 +1316,11 @@ else:
                             s_model, s_rpm
                         )
                         if isinstance(recovery_result, list):
-                            mapped = [item for item in recovery_result if isinstance(item, dict) and "error" not in item]
-                        elif isinstance(recovery_result, dict) and "error" not in recovery_result:
+                            mapped = [item for item in recovery_result if isinstance(item, dict) and not item.get("error")]
+                        elif isinstance(recovery_result, dict) and not recovery_result.get("error"):
                             inner = next((recovery_result[k] for k in recovery_result if isinstance(recovery_result[k], list)), None)
                             if inner:
-                                mapped = [item for item in inner if isinstance(item, dict) and "error" not in item]
+                                mapped = [item for item in inner if isinstance(item, dict) and not item.get("error")]
 
                     st.write(f"Reducing {len(mapped)} findings...")
                     red = await call_gemini_json_sum_async(client, rs, f"{ri}\nQ:{q}\nD:{json.dumps(mapped)}", s_model, s_rpm)
@@ -1336,6 +1339,21 @@ else:
                         red["matrix"] = [
                             n for n in (_normalize_compliance_item(m) for m in mapped) if n is not None
                         ]
+                    # Fallback: if the reduce step returned an empty/missing risks list, an error,
+                    # or a non-dict response but the map step did find items, build the risks list
+                    # directly from the mapped items.
+                    if s_obj == "Risk Assessment" and mapped and (
+                        not isinstance(red, dict) or not red.get("risks")
+                    ):
+                        if not isinstance(red, dict):
+                            red = {}
+                        red.pop("error", None)
+                        fallback_risks = [m for m in mapped if isinstance(m, dict) and not m.get("error")]
+                        # Normalise page (singular) → pages (array) for display consistency
+                        for item in fallback_risks:
+                            if "page" in item and "pages" not in item:
+                                item["pages"] = [item["page"]]
+                        red["risks"] = fallback_risks
                     # Normalize reduce-step matrix items to canonical key names so
                     # downstream display code always sees 'item', 'detail', 'mandatory', etc.
                     if s_obj == "Compliance Matrix" and isinstance(red, dict) and red.get("matrix"):
