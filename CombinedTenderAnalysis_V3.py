@@ -616,6 +616,60 @@ def clean_json_string(txt):
     # turning valid JSON into invalid JSON and causing all map results to be discarded.
     return txt
 
+def fix_json_string_newlines(txt: str) -> str:
+    """Escape unescaped control characters (newlines, tabs, carriage returns)
+    inside JSON string values to prevent 'Unterminated string' parse errors."""
+    result = []
+    in_str = False
+    escaped = False
+    ESCAPES = {'\n': '\\n', '\r': '\\r', '\t': '\\t'}
+    for ch in txt:
+        if escaped:
+            result.append(ch)
+            escaped = False
+        elif ch == '\\' and in_str:
+            result.append(ch)
+            escaped = True
+        elif ch == '"':
+            in_str = not in_str
+            result.append(ch)
+        elif in_str and ch in ESCAPES:
+            result.append(ESCAPES[ch])
+        else:
+            result.append(ch)
+    return ''.join(result)
+
+
+def repair_truncated_json(txt: str) -> str:
+    """Close any unterminated JSON string and open bracket/brace structures
+    to produce parseable JSON when the LLM response is truncated."""
+    stack = []
+    in_str = False
+    escaped = False
+    for ch in txt:
+        if escaped:
+            escaped = False
+            continue
+        if ch == '\\' and in_str:
+            escaped = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if not in_str:
+            if ch in '{[':
+                stack.append(ch)
+            elif ch in '}]':
+                if stack:
+                    stack.pop()
+    closers = []
+    if in_str:
+        closers.append('"')
+    for bracket in reversed(stack):
+        closers.append('}' if bracket == '{' else ']')
+    return txt + ''.join(closers)
+
+
 async def call_gemini_json_sum_async(client, sys, user, model, rpm):
     last_err = "unknown error"
     for attempt in range(2):  # initial attempt + one retry on rate-limit error
@@ -633,7 +687,15 @@ async def call_gemini_json_sum_async(client, sys, user, model, rpm):
                 resp = await client.aio.models.generate_content(model=model, contents=user, config=types.GenerateContentConfig(system_instruction=sys, response_mime_type="application/json"))
                 txt = clean_json_string(resp.text or "{}")
                 try: return json.loads(txt)
-                except:
+                except json.JSONDecodeError:
+                    # Fix 1: escape raw control characters (newlines etc.) inside strings
+                    fixed = fix_json_string_newlines(txt)
+                    try: return json.loads(fixed)
+                    except json.JSONDecodeError:
+                        # Fix 2: repair truncated / unclosed JSON structures
+                        try: return json.loads(repair_truncated_json(fixed))
+                        except json.JSONDecodeError: pass
+                    # Fix 3: convert single-quoted keys/values to double-quoted
                     txt = re.sub(r"(^|\s|{|,)\s*'([^']+)'\s*:", r'\1"\2":', txt)
                     txt = re.sub(r":\s*'([^']*)'(\s*[,}\]])", r': "\1"\2', txt)
                     try: return json.loads(txt)
