@@ -617,19 +617,40 @@ def clean_json_string(txt):
     return txt
 
 async def call_gemini_json_sum_async(client, sys, user, model, rpm):
-    await asyncio.sleep(max(0.1, 60.0 / max(rpm, 1)))
-    async with GLOBAL_SUM_CONCURRENCY:
-        try:
-            from google.genai import types
-            resp = await client.aio.models.generate_content(model=model, contents=user, config=types.GenerateContentConfig(system_instruction=sys, response_mime_type="application/json"))
-            txt = clean_json_string(resp.text or "{}")
-            try: return json.loads(txt)
-            except:
-                txt = re.sub(r"(^|\s|{|,)\s*'([^']+)'\s*:", r'\1"\2":', txt)
-                txt = re.sub(r":\s*'([^']*)'(\s*[,}\]])", r': "\1"\2', txt)
+    last_err = "unknown error"
+    for attempt in range(2):  # initial attempt + one retry on rate-limit error
+        if attempt > 0:
+            # Wait for the current rate-limit window to reset before retrying.
+            await asyncio.sleep(60)
+        async with GLOBAL_SUM_CONCURRENCY:
+            # Rate-limit sleep is now INSIDE the semaphore so that concurrent
+            # callers are serialised: the inter-call gap is correctly preserved
+            # instead of all tasks sleeping simultaneously (which caused a burst
+            # that exceeded the API quota).
+            await asyncio.sleep(max(0.1, 60.0 / max(rpm, 1)))
+            try:
+                from google.genai import types
+                resp = await client.aio.models.generate_content(model=model, contents=user, config=types.GenerateContentConfig(system_instruction=sys, response_mime_type="application/json"))
+                txt = clean_json_string(resp.text or "{}")
                 try: return json.loads(txt)
-                except Exception as e: return {"error": f"JSON parse error: {str(e)}", "raw": txt[:500]}
-        except Exception as e: return {"error": f"API failed: {str(e)}"}
+                except:
+                    txt = re.sub(r"(^|\s|{|,)\s*'([^']+)'\s*:", r'\1"\2":', txt)
+                    txt = re.sub(r":\s*'([^']*)'(\s*[,}\]])", r': "\1"\2', txt)
+                    try: return json.loads(txt)
+                    except Exception as e: return {"error": f"JSON parse error: {str(e)}", "raw": txt[:500]}
+            except Exception as e:
+                last_err = str(e)
+                is_rate_limit = (
+                    "429" in last_err
+                    or "RESOURCE_EXHAUSTED" in last_err
+                    or "rate" in last_err.lower()
+                    or "quota" in last_err.lower()
+                )
+                if not is_rate_limit or attempt > 0:
+                    # Non-retriable error or second attempt already tried — give up.
+                    return {"error": f"API failed: {last_err}"}
+                # Rate-limit on first attempt: fall through to retry with backoff.
+    return {"error": f"API failed: {last_err}"}
 
 def extract_pages_sum(path):
     doc = None
@@ -842,8 +863,14 @@ def _unwrap_batch_result(b, mode: str) -> list:
                 items = [item for item in b[k] if isinstance(item, dict) and not item.get("error")]
                 if items:
                     return items
-        # Last resort: treat the whole dict as a single finding
-        if b:
+        # Last resort: treat the whole dict as a single finding,
+        # but ONLY when it has no list-valued keys.
+        # A dict that still has list-valued keys at this point (e.g.
+        # {"matrix": [], "requirements": []}) is a container response whose
+        # lists were all empty or all-error — it is NOT a direct finding.
+        # Returning it as a finding would populate `mapped` with useless
+        # meta-dicts and prevent the recovery extraction from triggering.
+        if b and not any(isinstance(v, list) for v in b.values()):
             return [b]
     return []
 
