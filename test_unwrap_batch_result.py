@@ -37,8 +37,12 @@ def _unwrap_batch_result(b, mode: str) -> list:
                 items = [item for item in b[k] if isinstance(item, dict) and not item.get("error")]
                 if items:
                     return items
-        # Last resort: treat the whole dict as a single finding
-        if b:
+        # Last resort: treat the whole dict as a single finding,
+        # but ONLY when it has no list-valued keys.
+        # A dict that still has list-valued keys (e.g. {"matrix": [], "requirements": []})
+        # is a container response with empty lists — NOT a direct finding.  Returning
+        # it would populate `mapped` with useless meta-dicts and prevent recovery.
+        if b and not any(isinstance(v, list) for v in b.values()):
             return [b]
     return []
 
@@ -110,6 +114,31 @@ class TestUnwrapBatchResultComplianceMatrix:
     def test_last_resort_whole_dict_as_finding(self):
         """A valid dict with no list-valued keys is returned as a single-item list."""
         b = {"item": "Penalty Clause", "detail": "Late penalty 1%/day", "page": 7}
+        result = _unwrap_batch_result(b, "Compliance Matrix")
+        assert result == [b]
+
+    def test_container_dict_with_all_empty_lists_returns_empty(self):
+        """A container dict whose only values are empty lists must return [].
+
+        Before the fix, {"matrix": [], "requirements": []} reached the last-resort
+        and was returned as [b], which populated `mapped` with a useless meta-dict
+        and prevented recovery extraction from triggering.
+        """
+        b = {"matrix": [], "requirements": []}
+        result = _unwrap_batch_result(b, "Compliance Matrix")
+        assert result == [], (
+            "Container dicts with all-empty list values must not be treated as findings"
+        )
+
+    def test_container_dict_with_mixed_empty_list_and_scalar_returns_empty(self):
+        """Container dict with empty list + scalar meta-fields returns []."""
+        b = {"matrix": [], "total_requirements": 0, "summary": "No requirements found"}
+        result = _unwrap_batch_result(b, "Compliance Matrix")
+        assert result == []
+
+    def test_finding_dict_with_no_list_values_is_returned(self):
+        """A direct-finding dict that has no list values is returned via last resort."""
+        b = {"item": "Bond Requirement", "detail": "Bid bond of 2% required", "page": 4}
         result = _unwrap_batch_result(b, "Compliance Matrix")
         assert result == [b]
 
