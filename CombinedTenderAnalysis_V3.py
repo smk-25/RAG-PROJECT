@@ -723,7 +723,7 @@ RULE: Include every risk found in the text. Do not omit any risk, even if direct
         reduce_system = "You are consolidating risk assessments."
         reduce_instruction = """Consolidate finding D: into unique risks. Prioritize High/Critical.
 IMPORTANT: For each risk item, collect and list all unique page numbers from the source findings into the 'pages' array. Do NOT leave pages empty.
-CRITICAL: Preserve the exact 'evidence' text from each finding verbatim — do NOT modify, summarize, or omit the evidence values. Every risk item MUST have a non-empty evidence field.
+CRITICAL: Preserve the exact 'evidence' text from each finding verbatim — do NOT modify, summarize, or omit the evidence values. Include ALL risk items from the source findings — do NOT exclude any item, even if its evidence field is empty.
 Format: JSON {risks: [{clause, reason, evidence, risk_level, risk_type, impact, pages:[]}], risk_summary: {total_risks, critical_count, high_count, medium_count, low_count, by_type: {}}}"""
     elif mode == "Entity Dashboard":
         map_system = "You are extracting key entities and metadata."
@@ -793,6 +793,47 @@ Format: JSON {summary: "2-3 paragraphs", key_findings: [{finding, detail, import
 
 # Maximum character length used when truncating a detail string to produce a fallback item label.
 _MAX_FALLBACK_ITEM_LENGTH = 80
+
+# Priority-ordered key names to look for when the LLM wraps the findings array in a dict
+# (e.g. {"risks": [...]} instead of the bare [...]).  Using a priority list prevents
+# accidentally picking a different list-valued key (e.g. "citations" before "risks").
+_MODE_LIST_KEYS: dict[str, list[str]] = {
+    "Compliance Matrix": ["matrix", "requirements", "compliance_requirements", "items", "findings"],
+    "Risk Assessment": ["risks", "risk_items", "risk_findings", "findings", "items"],
+    "Ambiguity Scrutiny": ["ambiguities", "ambiguity_findings", "findings", "items"],
+    "Entity Dashboard": ["entities", "findings", "items"],
+    "Overall Summary & Voice": ["key_findings", "findings", "items"],
+    "General Summary": ["key_findings", "findings", "items"],
+}
+
+
+def _unwrap_batch_result(b, mode: str) -> list:
+    """Extract a list of finding dicts from a single batch LLM response.
+
+    Handles three formats returned by Gemini:
+    - A bare JSON array  → returned directly (filtered for valid dicts).
+    - A JSON object wrapping the array → tries mode-specific keys first, then
+      falls back to the first list-valued key, then treats the whole dict as a
+      single finding.
+    - None / error dict → returns an empty list.
+    """
+    if b is None:
+        return []
+    if isinstance(b, list):
+        return [item for item in b if isinstance(item, dict) and not item.get("error")]
+    if isinstance(b, dict) and not b.get("error"):
+        # Try mode-specific keys first for reliable extraction
+        for key in _MODE_LIST_KEYS.get(mode, []):
+            if isinstance(b.get(key), list):
+                return [item for item in b[key] if isinstance(item, dict) and not item.get("error")]
+        # Fall back to the first list-valued key found in the dict
+        inner_list = next((b[k] for k in b if isinstance(b[k], list)), None)
+        if inner_list is not None:
+            return [item for item in inner_list if isinstance(item, dict) and not item.get("error")]
+        # Last resort: treat the whole dict as a single finding
+        if b:
+            return [b]
+    return []
 
 def _resolve_mandatory_val(val) -> bool:
     """Normalise various LLM representations of mandatory/optional to a bool.
@@ -1287,40 +1328,27 @@ else:
                     mapped_batches = await asyncio.gather(*m_tasks); t_m = time.time()
                     mapped = []
                     for b in mapped_batches:
-                        if b is None:
-                            # json.loads("null") returns None if Gemini returns a JSON null response
-                            continue
-                        if isinstance(b, list):
-                            mapped.extend([item for item in b if isinstance(item, dict) and not item.get("error")])
-                        elif isinstance(b, dict) and not b.get("error"):
-                            # Try to unwrap if the LLM returned a dict with a list inside
-                            # (e.g. {"requirements": [...]} or {"items": [...]})
-                            inner_list = next((b[k] for k in b if isinstance(b[k], list)), None)
-                            if inner_list is not None:
-                                mapped.extend([item for item in inner_list if isinstance(item, dict) and not item.get("error")])
-                            elif b:  # Only append non-empty dicts that have no inner list
-                                mapped.append(b)
-                    
+                        mapped.extend(_unwrap_batch_result(b, s_obj))
+
                     # Recovery: if all map batches returned no items (e.g. all failed or LLM
-                    # returned empty arrays), attempt a single direct extraction on the first
-                    # batch of chunks before giving up and sending an empty D: to the reduce step.
+                    # returned empty arrays), attempt direct extraction on each remaining batch
+                    # of chunks sequentially until findings are produced.
                     if not mapped and chunks:
                         st.write("Map phase yielded no findings -- attempting recovery extraction...")
-                        recovery_payload = "\n\n".join(
-                            f"---\nID:{c['id']} P:{c['start_page']}\nText: {c['text']}"
-                            for c in chunks[:s_batch]
-                        )
-                        recovery_result = await call_gemini_json_sum_async(
-                            client, ms,
-                            f"{mi}\nQ:{q}\nContext Data:\n{recovery_payload}",
-                            s_model, s_rpm
-                        )
-                        if isinstance(recovery_result, list):
-                            mapped = [item for item in recovery_result if isinstance(item, dict) and not item.get("error")]
-                        elif isinstance(recovery_result, dict) and not recovery_result.get("error"):
-                            inner = next((recovery_result[k] for k in recovery_result if isinstance(recovery_result[k], list)), None)
-                            if inner:
-                                mapped = [item for item in inner if isinstance(item, dict) and not item.get("error")]
+                        for batch_start in range(0, len(chunks), s_batch):
+                            recovery_payload = "\n\n".join(
+                                f"---\nID:{c['id']} P:{c['start_page']}\nText: {c['text']}"
+                                for c in chunks[batch_start:batch_start + s_batch]
+                            )
+                            recovery_result = await call_gemini_json_sum_async(
+                                client, ms,
+                                f"{mi}\nQ:{q}\nContext Data:\n{recovery_payload}",
+                                s_model, s_rpm
+                            )
+                            recovered = _unwrap_batch_result(recovery_result, s_obj)
+                            if recovered:
+                                mapped.extend(recovered)
+                                break  # stop as soon as we get findings from any batch
 
                     st.write(f"Reducing {len(mapped)} findings...")
                     red = await call_gemini_json_sum_async(client, rs, f"{ri}\nQ:{q}\nD:{json.dumps(mapped)}", s_model, s_rpm)
@@ -1443,7 +1471,8 @@ else:
                                         if score > best_score:
                                             best_score = score
                                             best_chunk = chunk
-                                    if best_chunk and best_score >= 2:
+                                    min_score = 1 if len(search_words) <= 2 else 2
+                                    if best_chunk and best_score >= min_score:
                                         try:
                                             sents = simple_sent_tokenize_shared(best_chunk["text"])
                                             best_sent = max(sents, key=lambda s: sum(1 for w in search_words if w in s.lower()), default="")
@@ -1561,7 +1590,8 @@ else:
                                         if score > best_score:
                                             best_score = score
                                             best_chunk = chunk
-                                    if best_chunk and best_score >= 2:
+                                    min_score = 1 if len(search_words) <= 2 else 2
+                                    if best_chunk and best_score >= min_score:
                                         try:
                                             sents = simple_sent_tokenize_shared(best_chunk["text"])
                                             best_sent = max(sents, key=lambda s: sum(1 for w in search_words if w in s.lower()), default="")
@@ -1619,7 +1649,8 @@ else:
                                         if score > best_score:
                                             best_score = score
                                             best_chunk = chunk
-                                    if best_chunk and best_score >= 2:
+                                    min_score = 1 if len(search_words) <= 2 else 2
+                                    if best_chunk and best_score >= min_score:
                                         try:
                                             sents = simple_sent_tokenize_shared(best_chunk["text"])
                                             best_sent = max(sents, key=lambda s: sum(1 for w in search_words if w in s.lower()), default="")
