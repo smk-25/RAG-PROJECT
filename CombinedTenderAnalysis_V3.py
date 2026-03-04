@@ -701,12 +701,18 @@ def get_sum_prompts_full(mode: str):
     if mode == "Compliance Matrix":
         map_system = "You are a compliance requirements extractor analyzing tender documents. Extract specific, actionable requirements."
         map_instruction = """Extract ALL compliance requirements from the provided Context Data.
-Rules: Identify must/shall, specific criteria, conditional clauses, page numbers.
+Rules:
+- Identify ALL obligation and requirement language, including: must/shall/will/should/required/mandatory/needs to/has to/is to/are to/obligated to/expected to.
+- Also extract technical specifications, performance criteria, standards references, and conditional clauses even if no explicit modal verb is used.
 Each chunk in the Context Data is separated by "---" and has a header line "ID:... P:..." followed by "Text: <content>".
 Format: JSON array [{item, detail, evidence, category, mandatory, page}]
+- item: a short label for the requirement (e.g. "Submission Deadline", "Technical Specification").
+- detail: full description of the requirement.
 - evidence: copy the relevant sentence or clause from the "Text:" section of the chunk (the text after "Text:" up to the next "---" separator) that contains the requirement. If no clear evidence sentence is found, set this field to an empty string "".
+- category: classify as one of Technical, Legal, Financial, Administrative, Safety, or General.
+- mandatory: true if the language is binding (must/shall/required/mandatory), false otherwise.
 - page: use the P: value from the chunk header (the "ID:... P:..." line) that contains the requirement.
-Rule: Include every compliance requirement found in the text. Do not omit any requirement, even if evidence is unavailable -- set evidence to "" in that case. Every item must have a valid page number from the chunk header."""
+Rule: Include EVERY compliance requirement found in the text. Do NOT omit any requirement, even if evidence is unavailable -- set evidence to "" in that case. Every item must have a valid page number from the chunk header. If the chunk contains no compliance requirements at all, return an empty array []."""
         reduce_system = "You are consolidating compliance requirements into a unified matrix."
         reduce_instruction = """Consolidate the findings in D: into a unique compliance matrix. Deduplicate similar requirements.
 CRITICAL: Preserve the exact 'evidence' text from each finding verbatim — do NOT modify, summarize, or omit the evidence values. Include ALL matrix items from the source findings — do NOT exclude any item, even if its evidence field is empty.
@@ -822,14 +828,20 @@ def _unwrap_batch_result(b, mode: str) -> list:
     if isinstance(b, list):
         return [item for item in b if isinstance(item, dict) and not item.get("error")]
     if isinstance(b, dict) and not b.get("error"):
-        # Try mode-specific keys first for reliable extraction
+        # Try mode-specific keys first for reliable extraction.
+        # Skip keys whose list is empty or contains only error dicts so we
+        # can fall through to a later key that may have real findings.
         for key in _MODE_LIST_KEYS.get(mode, []):
-            if isinstance(b.get(key), list):
-                return [item for item in b[key] if isinstance(item, dict) and not item.get("error")]
-        # Fall back to the first list-valued key found in the dict
-        inner_list = next((b[k] for k in b if isinstance(b[k], list)), None)
-        if inner_list is not None:
-            return [item for item in inner_list if isinstance(item, dict) and not item.get("error")]
+            if isinstance(b.get(key), list) and b[key]:
+                items = [item for item in b[key] if isinstance(item, dict) and not item.get("error")]
+                if items:
+                    return items
+        # Fall back to the first non-empty list-valued key found in the dict
+        for k in b:
+            if isinstance(b[k], list) and b[k]:
+                items = [item for item in b[k] if isinstance(item, dict) and not item.get("error")]
+                if items:
+                    return items
         # Last resort: treat the whole dict as a single finding
         if b:
             return [b]
@@ -1332,7 +1344,9 @@ else:
 
                     # Recovery: if all map batches returned no items (e.g. all failed or LLM
                     # returned empty arrays), attempt direct extraction on each remaining batch
-                    # of chunks sequentially until findings are produced.
+                    # of chunks sequentially.  For modes that require comprehensive coverage
+                    # (e.g. Compliance Matrix) we scan ALL batches to collect all findings;
+                    # for other modes we stop as soon as we get any findings.
                     if not mapped and chunks:
                         st.write("Map phase yielded no findings -- attempting recovery extraction...")
                         for batch_start in range(0, len(chunks), s_batch):
@@ -1348,7 +1362,11 @@ else:
                             recovered = _unwrap_batch_result(recovery_result, s_obj)
                             if recovered:
                                 mapped.extend(recovered)
-                                break  # stop as soon as we get findings from any batch
+                                # For Compliance Matrix we must scan all batches to collect
+                                # every requirement across the full document.  For other
+                                # modes we stop after the first successful batch.
+                                if s_obj != "Compliance Matrix":
+                                    break
 
                     st.write(f"Reducing {len(mapped)} findings...")
                     red = await call_gemini_json_sum_async(client, rs, f"{ri}\nQ:{q}\nD:{json.dumps(mapped)}", s_model, s_rpm)
