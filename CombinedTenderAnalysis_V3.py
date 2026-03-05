@@ -309,14 +309,53 @@ class RAGDocument:
         self.metadata = metadata or {}
 
 def load_pdf_with_pymupdf(pdf_path: str) -> List[RAGDocument]:
+    """
+    Extract full text from every PDF page using:
+    - PyMuPDF block-sorted extraction (preserves reading order for multi-column layouts)
+    - pdfplumber table detection (appends tables as Markdown so no content is lost)
+    - Text cleaning (null bytes, redundant whitespace)
+    Mirrors the extract_pages() approach from Summarizationcode.py.
+    """
     docs = []
     try:
         pdf_document = fitz.open(pdf_path)
-        for page_num in range(len(pdf_document)):
-            page = pdf_document[page_num]
-            text = page.get_text()
-            if text.strip():
-                docs.append(RAGDocument(page_content=text, metadata={"page": page_num + 1}))
+        with pdfplumber.open(pdf_path) as pl_pdf:
+            for page_num in range(len(pdf_document)):
+                page = pdf_document[page_num]
+
+                # Block-sorted extraction preserves correct reading order for
+                # multi-column and complex layouts.
+                try:
+                    blocks = page.get_text("blocks")
+                    blocks = sorted(blocks, key=lambda b: (round(b[1], 1), round(b[0], 1)))
+                    text = "\n".join(
+                        b[4] for b in blocks if isinstance(b, (list, tuple)) and len(b) >= 5
+                    )
+                except Exception:
+                    text = page.get_text()
+
+                # Extract tables via pdfplumber and append as cleaned Markdown so
+                # tabular evidence is fully captured and not silently dropped.
+                if page_num < len(pl_pdf.pages):
+                    tables = pl_pdf.pages[page_num].extract_tables()
+                    for table in tables:
+                        if table:
+                            df_t = pd.DataFrame(table).dropna(how="all").dropna(axis=1, how="all")
+                            if not df_t.empty:
+                                text += (
+                                    f"\n\n[TABLE DATA - PAGE {page_num + 1}]:\n"
+                                    + df_t.to_markdown(index=False)
+                                    + "\n\n"
+                                )
+
+                # Normalise whitespace and remove null bytes that can corrupt
+                # downstream embeddings.
+                text = text.replace("\x00", " ").replace("\r\n", "\n")
+                text = re.sub(r"[ \t]+", " ", text)
+                text = re.sub(r"\n{3,}", "\n\n", text).strip()
+
+                if text:
+                    docs.append(RAGDocument(page_content=text, metadata={"page": page_num + 1}))
         pdf_document.close()
     except Exception as e:
         st.error(f"Error loading PDF: {e}")
@@ -831,34 +870,130 @@ async def call_gemini_json_sum_async(client, sys, user, model, rpm):
     return {"error": "max_retries_exceeded"}
 
 def extract_pages_sum(path):
+    """
+    Extract full text from every PDF page for the summarisation pipeline.
+    - Block-sorted extraction (correct reading order)
+    - pdfplumber table extraction with dropna + Markdown formatting
+    - Text cleaning (null bytes, redundant whitespace)
+    Mirrors the extract_pages() approach from Summarizationcode.py.
+    """
     doc = None
     try:
         doc, p, f = fitz.open(path), [], []
         with pdfplumber.open(path) as pl:
             for i, page in enumerate(doc):
-                t = page.get_text()
+                # Block-sorted extraction preserves reading order.
+                try:
+                    blocks = page.get_text("blocks")
+                    blocks = sorted(blocks, key=lambda b: (round(b[1], 1), round(b[0], 1)))
+                    t = "\n".join(
+                        b[4] for b in blocks if isinstance(b, (list, tuple)) and len(b) >= 5
+                    )
+                except Exception:
+                    t = page.get_text()
+
+                # Table extraction — clean empty rows/cols and emit as Markdown
+                # so the LLM sees structured data instead of raw whitespace.
                 if i < len(pl.pages):
                     tabs = pl.pages[i].extract_tables()
                     for tab in tabs:
-                        if tab: t += f"\n\n[TABLE]\n{pd.DataFrame(tab).to_markdown()}\n"
-                p.append(t); f.append(len(page.get_images()) > 0)
+                        if tab:
+                            df_t = pd.DataFrame(tab).dropna(how="all").dropna(axis=1, how="all")
+                            if not df_t.empty:
+                                t += (
+                                    f"\n\n[TABLE DATA - PAGE {i + 1}]:\n"
+                                    + df_t.to_markdown(index=False)
+                                    + "\n\n"
+                                )
+
+                # Normalise whitespace and remove null bytes.
+                t = t.replace("\x00", " ").replace("\r\n", "\n")
+                t = re.sub(r"[ \t]+", " ", t)
+                t = re.sub(r"\n{3,}", "\n\n", t).strip()
+
+                p.append(t)
+                f.append(len(page.get_images()) > 0)
         return p, f
     finally:
-        if doc: doc.close()
+        if doc:
+            doc.close()
 
 def semantic_chunk_pages_sum(pages, flags, max_tok=8000, overlap=5):
+    """
+    Chunk extracted pages into token-limited segments for the map/reduce pipeline.
+
+    Improvements over the previous flat-sentence approach (mirrors
+    Summarizationcode.py semantic_chunk_pages logic):
+    - Pages are first split into paragraphs so sentence boundaries are not
+      confused across unrelated blocks.
+    - Table-like blocks are kept together as individual row items so tabular
+      evidence is not split across chunks arbitrarily.
+    - Each sentence is prefixed with [Page N] so the LLM can cite exact pages.
+    - end_page is tracked in addition to start_page for multi-page chunks.
+    """
+    def _looks_like_table(text):
+        lines = [ln for ln in text.splitlines() if ln.strip()]
+        if not lines:
+            return False
+        numeric_lines = sum(1 for ln in lines if re.search(r'\d', ln))
+        has_delims = any(
+            '|' in ln or '\t' in ln or re.search(r'\s{2,}', ln) for ln in lines
+        )
+        return (numeric_lines / max(1, len(lines))) > 0.25 and has_delims
+
     flat = []
-    for i, p in enumerate(pages):
-        try: sents = nltk.sent_tokenize(p) if _NLTK_READY else simple_sent_tokenize_shared(p)
-        except: sents = simple_sent_tokenize_shared(p)
-        for s in sents: flat.append((i+1, s, flags[i]))
+    for i, (content, has_img) in enumerate(zip(pages, flags)):
+        content = content.strip()
+        if not content:
+            continue
+        # Split each page into paragraphs first for better semantic units.
+        paragraphs = re.split(r'\n\s*\n', content)
+        for par in paragraphs:
+            par = par.strip()
+            if not par:
+                continue
+            if _looks_like_table(par):
+                # Emit each row as its own flat item so table data is
+                # never split mid-row.
+                rows = [f"[Page {i + 1}] {r.strip()}" for r in par.splitlines() if r.strip()]
+                for r in rows:
+                    flat.append((i + 1, r, has_img))
+            else:
+                try:
+                    sents = nltk.sent_tokenize(par) if _NLTK_READY else simple_sent_tokenize_shared(par)
+                except Exception:
+                    sents = simple_sent_tokenize_shared(par)
+                if sents:
+                    # Prefix first sentence with page number for citation tracking.
+                    sents[0] = f"[Page {i + 1}] " + sents[0]
+                for s in sents:
+                    flat.append((i + 1, s, has_img))
+
     chunks, bs, bp, bf = [], [], [], []
-    for p, s, f in flat:
-        if sum(len(x)//4 for x in bs + [s]) > max_tok and bs:
-            chunks.append({"text": " ".join(bs).strip(), "start_page": min(bp), "has_visual": any(bf), "id": str(uuid.uuid4())[:8]})
-            bs, bp, bf = bs[-overlap:] if overlap > 0 else [], bp[-overlap:] if overlap > 0 else [], bf[-overlap:] if overlap > 0 else []
-        bs.append(s); bp.append(p); bf.append(f)
-    if bs: chunks.append({"text": " ".join(bs).strip(), "start_page": min(bp), "has_visual": any(bf), "id": str(uuid.uuid4())[:8]})
+    for pg, s, flag in flat:
+        if sum(len(x) // 4 for x in bs + [s]) > max_tok and bs:
+            chunks.append({
+                "text": " ".join(bs).strip(),
+                "start_page": min(bp),
+                "end_page": max(bp),
+                "has_visual": any(bf),
+                "id": str(uuid.uuid4())[:8],
+            })
+            bs = bs[-overlap:] if overlap > 0 else []
+            bp = bp[-overlap:] if overlap > 0 else []
+            bf = bf[-overlap:] if overlap > 0 else []
+        bs.append(s)
+        bp.append(pg)
+        bf.append(flag)
+
+    if bs:
+        chunks.append({
+            "text": " ".join(bs).strip(),
+            "start_page": min(bp),
+            "end_page": max(bp),
+            "has_visual": any(bf),
+            "id": str(uuid.uuid4())[:8],
+        })
     return [c for c in chunks if c["text"].strip()]
 
 def get_sum_prompts(mode: str):
@@ -998,6 +1133,20 @@ Format: JSON {summary: "2-3 paragraphs", key_findings: [{finding, detail, import
 
 # Maximum character length used when truncating a detail string to produce a fallback item label.
 _MAX_FALLBACK_ITEM_LENGTH = 80
+
+
+def _chunk_page_label(chunk: dict) -> str:
+    """Return a page-range label for a chunk, e.g. '5' or '5-8'.
+
+    Used to build the 'P:...' field in map-phase payloads so the LLM can
+    correctly attribute evidence that falls on any page within a multi-page
+    chunk, not just the first page.
+    """
+    start = chunk.get('start_page', '')
+    end = chunk.get('end_page', start)
+    if end and end != start:
+        return f"{start}-{end}"
+    return str(start)
 
 # Priority-ordered key names to look for when the LLM wraps the findings array in a dict
 # (e.g. {"risks": [...]} instead of the bare [...]).  Using a priority list prevents
@@ -1170,10 +1319,14 @@ def render_page_level_citations_sum(chunks, pages):
         st.markdown("**Source pages and text excerpts:**")
         page_chunks = {}
         for c in chunks:
-            p = c.get('start_page', 0)
-            if p in pages:
-                if p not in page_chunks: page_chunks[p] = []
-                page_chunks[p].append(c)
+            # Index the chunk under every page it spans so multi-page chunks
+            # appear under each of their source pages, not just start_page.
+            start = c.get('start_page', 0)
+            end = c.get('end_page', start)
+            for p in range(start, end + 1):
+                if p in pages:
+                    if p not in page_chunks: page_chunks[p] = []
+                    page_chunks[p].append(c)
         for p_num in sorted(page_chunks.keys()):
             st.markdown(f"#### 📄 Page {p_num}")
             for idx, c in enumerate(page_chunks[p_num]):
@@ -1539,12 +1692,20 @@ else:
                     st.write(f"Mapping query: {q}...")
                     m_tasks = []
                     for b in batches:
-                        # Prepend ID and Page to each chunk's text for better model attribution
-                        chunk_payload = "\n\n".join([f"---\nID:{c['id']} P:{c['start_page']}\nText: {c['text']}" for c in b])
+                        # Show full page range (P:start-end) so the LLM can correctly
+                        # attribute evidence that falls on any page within a multi-page chunk.
+                        chunk_payload = "\n\n".join([
+                            f"---\nID:{c['id']} P:{_chunk_page_label(c)}\nText: {c['text']}"
+                            for c in b
+                        ])
                         m_tasks.append(call_gemini_json_sum_async(client, ms, f"{mi}\nQ:{q}\nContext Data:\n{chunk_payload}", s_model, s_rpm))
-                    mapped_batches = await asyncio.gather(*m_tasks); t_m = time.time()
+                    # return_exceptions=True prevents one failing batch from cancelling
+                    # all other concurrent tasks (mirrors Summarizationcode.py reduce phase).
+                    mapped_batches = await asyncio.gather(*m_tasks, return_exceptions=True); t_m = time.time()
                     mapped = []
                     for b in mapped_batches:
+                        if isinstance(b, Exception):
+                            continue  # skip failed batches, keep results from the rest
                         mapped.extend(_unwrap_batch_result(b, s_obj))
 
                     # Recovery: if all map batches returned no items (e.g. all failed or LLM
@@ -1556,7 +1717,7 @@ else:
                         st.write("Map phase yielded no findings -- attempting recovery extraction...")
                         for batch_start in range(0, len(chunks), s_batch):
                             recovery_payload = "\n\n".join(
-                                f"---\nID:{c['id']} P:{c['start_page']}\nText: {c['text']}"
+                                f"---\nID:{c['id']} P:{_chunk_page_label(c)}\nText: {c['text']}"
                                 for c in chunks[batch_start:batch_start + s_batch]
                             )
                             recovery_result = await call_gemini_json_sum_async(
