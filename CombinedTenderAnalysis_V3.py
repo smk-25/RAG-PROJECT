@@ -589,7 +589,92 @@ def map_answer_to_clauses_rag(answer, used, em):
 # --------------------------
 # Summarization Components
 # --------------------------
-GLOBAL_SUM_CONCURRENCY = asyncio.Semaphore(2)
+
+class ConcurrencyManager:
+    """Manages a global semaphore that is safe across Streamlit event loop re-runs.
+
+    A plain asyncio.Semaphore created at module level becomes bound to the event
+    loop that was current when it was first *used*.  Because Streamlit calls
+    asyncio.run() on every analysis run, a new event loop is created each time
+    and the old semaphore silently hangs or raises RuntimeError.  This manager
+    recreates the semaphore whenever the running event loop changes.
+    """
+    def __init__(self, value: int):
+        self.value = value
+        self._sem = None
+        self._loop = None
+
+    def get(self):
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            return None  # Should not happen inside asyncio.run()
+        if self._sem is None or self._loop != loop:
+            self._sem = asyncio.Semaphore(self.value)
+            self._loop = loop
+        return self._sem
+
+
+_SUM_CONCURRENCY_MGR = ConcurrencyManager(2)
+
+
+class TokenBucket:
+    """Token-bucket rate limiter that is safe across Streamlit event loop re-runs.
+
+    asyncio.Lock is also event-loop-bound, so the lock is recreated whenever the
+    running loop changes (same pattern as ConcurrencyManager above).
+    """
+    def __init__(self, rpm: int):
+        self.spacing = 60.0 / max(1, rpm)
+        self.last_call = 0.0
+        self._lock = None
+
+    @property
+    def lock(self):
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            if self._lock is None:
+                self._lock = asyncio.Lock()
+            return self._lock
+        if not hasattr(self, '_loop_id'):
+            self._loop_id = None
+        current_loop_id = id(loop)
+        if self._lock is None or self._loop_id != current_loop_id:
+            self._lock = asyncio.Lock()
+            self._loop_id = current_loop_id
+        return self._lock
+
+    async def wait(self):
+        async with self.lock:
+            now = asyncio.get_event_loop().time()
+            if self.last_call < now:
+                self.last_call = now
+            wait_time = (self.last_call + self.spacing) - now
+            if wait_time > 0:
+                await asyncio.sleep(min(wait_time, 60.0))
+                self.last_call += self.spacing
+            else:
+                self.last_call = now + self.spacing + random.uniform(0.05, 0.20)
+
+    async def report_429(self, wait_sec: float):
+        """Global push-back when a 429 is received."""
+        async with self.lock:
+            now = asyncio.get_event_loop().time()
+            self.last_call = max(self.last_call, now + wait_sec)
+            try:
+                st.session_state["api_backoff_until"] = time.time() + wait_sec
+            except Exception:
+                pass
+
+
+_sum_rate_limiters: dict = {}
+
+
+def get_sum_limiter(rpm: int) -> TokenBucket:
+    if rpm not in _sum_rate_limiters:
+        _sum_rate_limiters[rpm] = TokenBucket(rpm)
+    return _sum_rate_limiters[rpm]
 
 def clean_json_string(txt):
     if not txt: return "{}"
@@ -671,48 +756,79 @@ def repair_truncated_json(txt: str) -> str:
 
 
 async def call_gemini_json_sum_async(client, sys, user, model, rpm):
-    last_err = "unknown error"
-    for attempt in range(2):  # initial attempt + one retry on rate-limit error
-        if attempt > 0:
-            # Wait for the current rate-limit window to reset before retrying.
-            await asyncio.sleep(60)
-        async with GLOBAL_SUM_CONCURRENCY:
-            # Rate-limit sleep is now INSIDE the semaphore so that concurrent
-            # callers are serialised: the inter-call gap is correctly preserved
-            # instead of all tasks sleeping simultaneously (which caused a burst
-            # that exceeded the API quota).
-            await asyncio.sleep(max(0.1, 60.0 / max(rpm, 1)))
-            try:
-                from google.genai import types
-                resp = await client.aio.models.generate_content(model=model, contents=user, config=types.GenerateContentConfig(system_instruction=sys, response_mime_type="application/json"))
-                txt = clean_json_string(resp.text or "{}")
-                try: return json.loads(txt)
-                except json.JSONDecodeError:
-                    # Fix 1: escape raw control characters (newlines etc.) inside strings
-                    fixed = fix_json_string_newlines(txt)
-                    try: return json.loads(fixed)
-                    except json.JSONDecodeError:
-                        # Fix 2: repair truncated / unclosed JSON structures
-                        try: return json.loads(repair_truncated_json(fixed))
-                        except json.JSONDecodeError: pass
-                    # Fix 3: convert single-quoted keys/values to double-quoted
-                    txt = re.sub(r"(^|\s|{|,)\s*'([^']+)'\s*:", r'\1"\2":', txt)
-                    txt = re.sub(r":\s*'([^']*)'(\s*[,}\]])", r': "\1"\2', txt)
-                    try: return json.loads(txt)
-                    except Exception as e: return {"error": f"JSON parse error: {str(e)}", "raw": txt[:500]}
-            except Exception as e:
-                last_err = str(e)
-                is_rate_limit = (
-                    "429" in last_err
-                    or "RESOURCE_EXHAUSTED" in last_err
-                    or "rate" in last_err.lower()
-                    or "quota" in last_err.lower()
+    """Robust Gemini JSON call using ConcurrencyManager + TokenBucket rate limiting.
+
+    Mirrors the call_gemini_json_async pattern from Summarizationcode.py:
+    - Uses ConcurrencyManager.get() so the semaphore is always bound to the
+      *current* event loop (safe across multiple asyncio.run() calls in Streamlit).
+    - Uses TokenBucket for proper inter-call spacing and 429 back-off.
+    - Up to 20 retries with exponential back-off, matching the working pipeline
+      in Summarizationcode.py.
+    """
+    limiter = get_sum_limiter(rpm)
+    backoff = 5.0
+
+    for attempt in range(20):
+        try:
+            await limiter.wait()
+            sem = _SUM_CONCURRENCY_MGR.get()
+            from google.genai import types
+            gen_config = types.GenerateContentConfig(
+                system_instruction=sys,
+                response_mime_type="application/json"
+            )
+            if sem:
+                async with sem:
+                    resp = await client.aio.models.generate_content(
+                        model=model, contents=user, config=gen_config
+                    )
+            else:
+                resp = await client.aio.models.generate_content(
+                    model=model, contents=user, config=gen_config
                 )
-                if not is_rate_limit or attempt > 0:
-                    # Non-retriable error or second attempt already tried — give up.
-                    return {"error": f"API failed: {last_err}"}
-                # Rate-limit on first attempt: fall through to retry with backoff.
-    return {"error": f"API failed: {last_err}"}
+            txt = clean_json_string(resp.text or "{}")
+            try:
+                return json.loads(txt)
+            except json.JSONDecodeError:
+                # Fix 1: escape raw control characters (newlines etc.) inside strings
+                fixed = fix_json_string_newlines(txt)
+                try:
+                    return json.loads(fixed)
+                except json.JSONDecodeError:
+                    # Fix 2: repair truncated / unclosed JSON structures
+                    try:
+                        return json.loads(repair_truncated_json(fixed))
+                    except json.JSONDecodeError:
+                        pass
+                # Fix 3: convert single-quoted keys/values to double-quoted
+                txt = re.sub(r"(^|\s|{|,)\s*'([^']+)'\s*:", r'\1"\2":', txt)
+                txt = re.sub(r":\s*'([^']*)'(\s*[,}\]])", r': "\1"\2', txt)
+                try:
+                    return json.loads(txt)
+                except Exception as e:
+                    return {"error": f"JSON parse error: {str(e)}", "raw": txt[:500]}
+        except Exception as e:
+            last_err = str(e)
+            msg = last_err.lower()
+            if "429" in msg or "resource_exhausted" in msg or "rate" in msg or "quota" in msg:
+                wait_sec = backoff + random.random() * 2
+                match = re.search(r"retrydelay':\s*'(\d+)s", msg)
+                if match:
+                    try:
+                        wait_sec = float(match.group(1)) + 1
+                    except (ValueError, AttributeError):
+                        pass
+                await limiter.report_429(wait_sec)
+                await asyncio.sleep(wait_sec)
+                backoff = min(backoff * 2.0, 120.0)
+                continue
+            if "400" in msg or "invalid_argument" in msg:
+                return {"error": f"Invalid request: {last_err}"}
+            if attempt == 19:
+                return {"error": last_err}
+            await asyncio.sleep(backoff + random.random())
+            backoff *= 1.5
+    return {"error": "max_retries_exceeded"}
 
 def extract_pages_sum(path):
     doc = None
