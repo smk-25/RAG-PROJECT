@@ -997,39 +997,49 @@ def semantic_chunk_pages_sum(pages, flags, max_tok=8000, overlap=5):
     return [c for c in chunks if c["text"].strip()]
 
 def get_sum_prompts(mode: str):
+    """Return (map_system, map_instruction, reduce_system, reduce_instruction).
+
+    The MAP phase uses lightweight, format-focused prompts (adapted from
+    Summarizationcode.py's get_prompts) so the LLM is not over-constrained
+    during the scanning pass.  Strict mandatory-evidence rules in
+    get_sum_prompts_full were causing the LLM to return empty arrays for the
+    four specific objectives (Compliance Matrix, Risk Assessment, Entity
+    Dashboard, Ambiguity Scrutiny).
+
+    The REDUCE phase still uses the detailed prompts from get_sum_prompts_full
+    so the final consolidated output retains high quality.
+    """
     if mode == "Compliance Matrix":
-        s1 = "You are a compliance requirement extractor."
-        mi = "Extract ALL compliance requirements (must/shall) in strict JSON array format."
-        s2 = "You are consolidating findings."
-        ri = "Generate a comprehensive compliance matrix JSON."
+        ms = "Extract mandatory tender requirements (Technical, Financial, Legal)."
+        mi = ('Return JSON array: [{"item": "short label", "detail": "requirement description", '
+              '"evidence": "verbatim quote from text", "category": "Technical/Legal/Financial/Administrative/Safety/General", '
+              '"mandatory": true, "page": 1}]')
     elif mode == "Risk Assessment":
-        s1 = "You are a risk analyst."
-        mi = "Extract all risks/liabilities in JSON array."
-        s2 = "You are consolidating risk findings."
-        ri = "Generate structured risk assessment JSON."
+        ms = "Flag high-risk tender clauses (Liabilities, Penalties, Termination)."
+        mi = ('Return JSON array: [{"clause": "topic", "reason": "why it is risky", '
+              '"evidence": "verbatim quote from text", "risk_level": "High/Medium/Low", '
+              '"risk_type": "...", "impact": "...", "page": 1}]')
     elif mode == "Entity Dashboard":
-        s1 = "You are extracting named entities."
-        mi = "Extract Organizations, People, Locations, Dates, Deadlines, Financials, Contacts, Technicals in JSON array."
-        s2 = "You are compiling an entity dashboard."
-        ri = "Generate categorized entity JSON."
+        ms = "Extract critical tender metadata: Organizations, People, Locations, Dates, Deadlines, Financials, Contacts, Technicals."
+        mi = ('Return JSON array: [{"category": "Organization/People/Location/Date/Deadline/Financial/Contact/Technical", '
+              '"entity": "...", "context": "brief context", "evidence": "verbatim quote from text", "page": 1}]')
     elif mode == "Ambiguity Scrutiny":
-        s1 = "You are identifying vague language."
-        mi = "Extract ambiguous terms/clauses in JSON array."
-        s2 = "You are consolidating ambiguities."
-        ri = "Generate detailed Scrutiny Report JSON."
+        ms = "Identify ambiguous, conflicting, or vague clauses that need clarification from the authority."
+        mi = ('Return JSON array: [{"ambiguous_text": "vague term or clause", '
+              '"ambiguity_type": "vague/conflicting/missing/unclear", "issue": "description of the problem", '
+              '"evidence": "verbatim quote from text", "suggested_query": "formal question for bidder meet", '
+              '"severity": "High/Medium/Low", "page": 1}]')
     elif mode == "Overall Summary & Voice":
-        s1 = "You are a comprehensive tender analyst."
-        mi = "Extract detailed project, financial, and multi-domain technical data in JSON array."
-        s2 = "You are synthesizing a master briefing."
-        ri = "Generate a massive, detailed narrative summary spanning all domains."
+        ms = "You are a comprehensive tender analyst."
+        mi = ('Return JSON array: [{"domain": "Scope/Timeline/Financial/Technical/Legal", '
+              '"topic": "topic title", "detail": "full description", '
+              '"evidence": "verbatim quote from text", "importance": "High/Medium/Low", "page": 1}]')
     else:
-        s1 = "You are a content summarizer."
-        mi = "Extract key findings in JSON array."
-        s2 = "You are synthesizing findings."
-        ri = "Generate comprehensive summary JSON."
-    # Prompts would be full in production, simplified here for space in call
-    # I will stick to full versions for quality
-    return get_sum_prompts_full(mode)
+        ms = "Extract key details, scope, deliverables, or any informative sections relevant to the query."
+        mi = ('Return JSON array: [{"finding": "topic title", "detail": "important details or exact quote", '
+              '"type": "...", "importance": "High/Medium/Low", "page": 1}]')
+    _map_sys, _map_ins, rs, ri = get_sum_prompts_full(mode)
+    return ms, mi, rs, ri
 
 def get_sum_prompts_full(mode: str):
     if mode == "Compliance Matrix":
