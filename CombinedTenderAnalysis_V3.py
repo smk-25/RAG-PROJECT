@@ -1134,6 +1134,20 @@ Format: JSON {summary: "2-3 paragraphs", key_findings: [{finding, detail, import
 # Maximum character length used when truncating a detail string to produce a fallback item label.
 _MAX_FALLBACK_ITEM_LENGTH = 80
 
+
+def _chunk_page_label(chunk: dict) -> str:
+    """Return a page-range label for a chunk, e.g. '5' or '5-8'.
+
+    Used to build the 'P:...' field in map-phase payloads so the LLM can
+    correctly attribute evidence that falls on any page within a multi-page
+    chunk, not just the first page.
+    """
+    start = chunk.get('start_page', '')
+    end = chunk.get('end_page', start)
+    if end and end != start:
+        return f"{start}-{end}"
+    return str(start)
+
 # Priority-ordered key names to look for when the LLM wraps the findings array in a dict
 # (e.g. {"risks": [...]} instead of the bare [...]).  Using a priority list prevents
 # accidentally picking a different list-valued key (e.g. "citations" before "risks").
@@ -1305,10 +1319,14 @@ def render_page_level_citations_sum(chunks, pages):
         st.markdown("**Source pages and text excerpts:**")
         page_chunks = {}
         for c in chunks:
-            p = c.get('start_page', 0)
-            if p in pages:
-                if p not in page_chunks: page_chunks[p] = []
-                page_chunks[p].append(c)
+            # Index the chunk under every page it spans so multi-page chunks
+            # appear under each of their source pages, not just start_page.
+            start = c.get('start_page', 0)
+            end = c.get('end_page', start)
+            for p in range(start, end + 1):
+                if p in pages:
+                    if p not in page_chunks: page_chunks[p] = []
+                    page_chunks[p].append(c)
         for p_num in sorted(page_chunks.keys()):
             st.markdown(f"#### 📄 Page {p_num}")
             for idx, c in enumerate(page_chunks[p_num]):
@@ -1674,12 +1692,20 @@ else:
                     st.write(f"Mapping query: {q}...")
                     m_tasks = []
                     for b in batches:
-                        # Prepend ID and Page to each chunk's text for better model attribution
-                        chunk_payload = "\n\n".join([f"---\nID:{c['id']} P:{c['start_page']}\nText: {c['text']}" for c in b])
+                        # Show full page range (P:start-end) so the LLM can correctly
+                        # attribute evidence that falls on any page within a multi-page chunk.
+                        chunk_payload = "\n\n".join([
+                            f"---\nID:{c['id']} P:{_chunk_page_label(c)}\nText: {c['text']}"
+                            for c in b
+                        ])
                         m_tasks.append(call_gemini_json_sum_async(client, ms, f"{mi}\nQ:{q}\nContext Data:\n{chunk_payload}", s_model, s_rpm))
-                    mapped_batches = await asyncio.gather(*m_tasks); t_m = time.time()
+                    # return_exceptions=True prevents one failing batch from cancelling
+                    # all other concurrent tasks (mirrors Summarizationcode.py reduce phase).
+                    mapped_batches = await asyncio.gather(*m_tasks, return_exceptions=True); t_m = time.time()
                     mapped = []
                     for b in mapped_batches:
+                        if isinstance(b, Exception):
+                            continue  # skip failed batches, keep results from the rest
                         mapped.extend(_unwrap_batch_result(b, s_obj))
 
                     # Recovery: if all map batches returned no items (e.g. all failed or LLM
@@ -1691,7 +1717,7 @@ else:
                         st.write("Map phase yielded no findings -- attempting recovery extraction...")
                         for batch_start in range(0, len(chunks), s_batch):
                             recovery_payload = "\n\n".join(
-                                f"---\nID:{c['id']} P:{c['start_page']}\nText: {c['text']}"
+                                f"---\nID:{c['id']} P:{_chunk_page_label(c)}\nText: {c['text']}"
                                 for c in chunks[batch_start:batch_start + s_batch]
                             )
                             recovery_result = await call_gemini_json_sum_async(
