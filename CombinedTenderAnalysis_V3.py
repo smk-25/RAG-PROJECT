@@ -436,6 +436,10 @@ class VectorStoreRAG:
         self.collection = self.client.get_or_create_collection(name=collection_name)
     def add_documents(self, docs, embs):
         ids = [f"{d.metadata.get('file_hash','na')}_{sha256_text_shared(d.page_content)}" for d in docs]
+        try:
+            self.collection.delete(ids=ids)
+        except Exception:
+            pass
         self.collection.add(ids=ids, documents=[d.page_content for d in docs], metadatas=[d.metadata for d in docs], embeddings=embs.tolist())
 
 class SparseBM25IndexRAG:
