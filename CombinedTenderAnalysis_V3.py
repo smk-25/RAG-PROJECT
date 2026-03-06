@@ -215,6 +215,9 @@ CLAUSE_PATTERNS = [
     r'\([a-z]\)',
     r'[•\-]\s+',
 ]
+EMBEDDING_BATCH_SIZE = 64          # Encode in batches to limit peak memory
+MAX_CITATION_SENTENCES = 50        # Cap sentences fed into citation embedding pass
+MAX_CHUNKS_WARNING_THRESHOLD = 1500  # Warn user when chunk count is very high
 
 # --------------------------
 # Initialization
@@ -229,6 +232,26 @@ def setup_nltk_shared():
         st.warning(f"Failed to download NLTK data: {e}")
         return False
 _NLTK_READY = setup_nltk_shared()
+
+@st.cache_resource
+def load_embedding_model_cached(model_name: str = "all-MiniLM-L6-v2"):
+    """Load (and cache) a SentenceTransformer so the model is only downloaded
+    and allocated once per Streamlit server lifetime, regardless of how many
+    times the user presses 'Index Documents'.
+    """
+    return SentenceTransformer(model_name)
+
+@st.cache_resource
+def load_cross_encoder_cached(model_name: str):
+    """Load (and cache) a CrossEncoder model. Returns None when the
+    sentence-transformers CrossEncoder is unavailable.
+    """
+    if not CROSS_ENCODER_AVAILABLE or CrossEncoder is None:
+        return None
+    try:
+        return CrossEncoder(model_name)
+    except Exception:
+        return None
 
 # Shared Utils
 def sha256_text_shared(text: str) -> str:
@@ -426,9 +449,14 @@ def apply_chunking_method(docs: List[RAGDocument], method: str, chunk_size: int 
 # --------------------------
 class EmbeddingManagerRAG:
     def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
-        self.model = SentenceTransformer(model_name)
+        self.model_name = model_name
+        # Reuse a cached model instance to avoid reloading weights on every run
+        self.model = load_embedding_model_cached(model_name)
     def generate_embeddings(self, texts: List[str]) -> np.ndarray:
-        return self.model.encode(texts, show_progress_bar=False)
+        if not texts:
+            return np.zeros((0, DEFAULT_EMBEDDING_DIM), dtype=np.float32)
+        # Encode in fixed-size batches to keep peak memory usage bounded
+        return self.model.encode(texts, show_progress_bar=False, batch_size=EMBEDDING_BATCH_SIZE)
 
 class VectorStoreRAG:
     def __init__(self, collection_name: str = "pdf_documents", path: str = "./vector_store"):
@@ -450,8 +478,10 @@ class VectorStoreRAG:
 
 class SparseBM25IndexRAG:
     def __init__(self): self.bm25, self.docs = None, []
-    def build(self, docs, embs):
-        self.docs = [{"id": sha256_text_shared(d.page_content), "content": d.page_content, "metadata": d.metadata, "emb": e} for d, e in zip(docs, embs)]
+    def build(self, docs):
+        # Store only id/content/metadata – embeddings are already persisted in
+        # ChromaDB and holding a second copy here wastes significant memory.
+        self.docs = [{"id": sha256_text_shared(d.page_content), "content": d.page_content, "metadata": d.metadata} for d in docs]
         self.bm25 = BM25Okapi([tokenize_simple_shared(d.page_content) for d in docs])
     def is_ready(self): return self.bm25 is not None
     def get_top_n(self, q, n):
@@ -588,6 +618,8 @@ def map_sentences_to_sources_rag(answer, used, em):
     try:
         s_sents = extract_sentences_from_chunks(used)
         if not s_sents: return []
+        # Limit the number of source sentences to avoid OOM on large contexts
+        s_sents = s_sents[:MAX_CITATION_SENTENCES]
         a_embs, s_embs = em.generate_embeddings(a_sents), em.generate_embeddings([s["text"] for s in s_sents])
         sims = cosine_similarity(a_embs, s_embs)
         cites = []
@@ -623,6 +655,8 @@ def map_answer_to_clauses_rag(answer, used, em):
     try:
         clauses = extract_clauses_from_chunks(used)
         if not clauses: return []
+        # Limit the number of clauses to avoid OOM on large contexts
+        clauses = clauses[:MAX_CITATION_SENTENCES]
         a_embs, c_embs = em.generate_embeddings(a_sents), em.generate_embeddings([c["text"] for c in clauses])
         sims = cosine_similarity(a_embs, c_embs)
         cites = []
@@ -1599,6 +1633,9 @@ if choice == "⚡ Simple QA (RAG)":
                         except: pass
                 
                 st.write(f"Generating Embeddings for {len(all_chunks)} chunks...")
+                if len(all_chunks) > MAX_CHUNKS_WARNING_THRESHOLD:
+                    st.warning(f"⚠️ Large document set detected ({len(all_chunks)} chunks). "
+                               "Embeddings are generated in batches to limit memory usage.")
                 texts = [c.page_content for c in all_chunks]
                 embs = em.generate_embeddings(texts)
                 vs.add_documents(all_chunks, embs)
@@ -1606,8 +1643,11 @@ if choice == "⚡ Simple QA (RAG)":
                 
                 if u_spa and BM25_AVAILABLE:
                     st.write("Building Sparse BM25 Index...")
-                    bm = SparseBM25IndexRAG(); bm.build(all_chunks, embs)
+                    bm = SparseBM25IndexRAG(); bm.build(all_chunks)
                     st.session_state["rbm_v2"] = bm
+                
+                # Release large intermediate arrays to free memory promptly
+                del texts, embs, all_chunks
                 
                 st.write("Success!")
                 status.update(label="Index Complete!", state="complete", expanded=False)
@@ -1628,7 +1668,7 @@ if choice == "⚡ Simple QA (RAG)":
             if not ga_key: st.error("Groq API Key Mandatory"); st.stop()
             with st.status("Processing Request...", expanded=True) as status:
                 t_start = time.time()
-                cr = CrossEncoder(crs_m) if u_crs and CROSS_ENCODER_AVAILABLE else None
+                cr = load_cross_encoder_cached(crs_m) if u_crs and CROSS_ENCODER_AVAILABLE else None
                 llm = GroqLLMRAG(key=ga_key)
                 ret = RAGRetrieverRAG(st.session_state["rvs_v2"], st.session_state["sem_v2"], cr, sparse=st.session_state.get("rbm_v2"), use_s=u_spa)
                 
