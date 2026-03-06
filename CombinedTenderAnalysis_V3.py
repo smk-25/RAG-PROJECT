@@ -2114,7 +2114,26 @@ else:
             
             conf = compute_confidence_score_sum(r['mapped'], r['result'], r['query'])
             render_metric_cards(r.get('chunk_count', len(r['mapped'])), r['total_t'], conf['overall_confidence'])
-            
+
+            with st.expander("🔍 Confidence Score Breakdown", expanded=False):
+                sc_col1, sc_col2, sc_col3, sc_col4 = st.columns(4)
+                score_details = [
+                    ("📄 Snippet Coverage",    conf['snippet_coverage'],    "Weight: 25%", "Number of context chunks mapped to the query"),
+                    ("🧩 Result Coherence",    conf['result_coherence'],    "Weight: 25%", "Completeness of structured AI output fields"),
+                    ("📊 Information Density", conf['information_density'], "Weight: 20%", "Richness of response relative to query length"),
+                    ("📌 Citation Confidence", conf['citation_confidence'], "Weight: 30%", "Unique page citations grounding the result"),
+                ]
+                for col, (label, score, weight, desc) in zip([sc_col1, sc_col2, sc_col3, sc_col4], score_details):
+                    sc = "#EF4444" if score < 0.3 else "#F59E0B" if score < 0.7 else "#10B981"
+                    with col:
+                        st.markdown(f"""
+                        <div style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:0.75rem;text-align:center;">
+                            <div style="font-size:0.72rem;color:#9ca3af;margin-bottom:3px;">{weight}</div>
+                            <div style="font-size:0.82rem;font-weight:600;color:#374151;margin-bottom:6px;">{label}</div>
+                            <div style="font-size:1.5rem;font-weight:700;color:{sc};">{score:.1%}</div>
+                            <div style="font-size:0.7rem;color:#9ca3af;margin-top:5px;">{desc}</div>
+                        </div>""", unsafe_allow_html=True)
+
             # Action Tabs for V2
             tabs_list = ["📊 Data Visualization", "🖼️ Context Preview", "📥 Export & Raw"]
             if s_obj == "Overall Summary & Voice":
@@ -2136,6 +2155,15 @@ else:
                 # Dashboard logic
                 if s_obj == "Entity Dashboard" and "dashboard" in r["result"]:
                     dash = r["result"]["dashboard"]
+                    # Category summary
+                    cat_counts = {cat: len(items) for cat, items in dash.items() if isinstance(items, list) and items}
+                    if cat_counts:
+                        st.markdown("#### 📊 Category Summary")
+                        cc_cols = st.columns(min(len(cat_counts), 4))
+                        for i, (cat, cnt) in enumerate(cat_counts.items()):
+                            with cc_cols[i % len(cc_cols)]:
+                                st.metric(cat, cnt)
+                        st.markdown("---")
                     for cat, items in dash.items():
                         if items and isinstance(items, list):
                             st.markdown(f"**{cat}** ({len(items)})")
@@ -2152,8 +2180,24 @@ else:
                                     st.markdown("---")
                 elif s_obj == "Risk Assessment" and "risks" in r["result"]:
                     risks = r["result"]["risks"]
-                    for idx, risk in enumerate(risks):
-                        if not isinstance(risk, dict): continue
+                    valid_risks = [rk for rk in risks if isinstance(rk, dict)]
+                    # Type/Level summary
+                    if valid_risks:
+                        st.markdown("#### 📊 Risk Summary by Type & Level")
+                        _LEVEL_ORDER = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
+                        type_counts = collections.Counter(rk.get('risk_type', 'Unknown') for rk in valid_risks)
+                        level_counts = collections.Counter(rk.get('risk_level', 'Unknown') for rk in valid_risks)
+                        rs_col1, rs_col2 = st.columns(2)
+                        with rs_col1:
+                            st.markdown("**By Type**")
+                            for t, cnt in sorted(type_counts.items(), key=lambda x: -x[1]):
+                                st.markdown(f"- {t}: **{cnt}**")
+                        with rs_col2:
+                            st.markdown("**By Level**")
+                            for lvl, cnt in sorted(level_counts.items(), key=lambda x: _LEVEL_ORDER.get(x[0], 99)):
+                                st.markdown(f"- {lvl}: **{cnt}**")
+                        st.markdown("---")
+                    for idx, risk in enumerate(valid_risks):
                         with st.container():
                             st.markdown(f"**{idx+1}. {risk.get('risk_type', 'Risk')}** — `{risk.get('risk_level', 'Unknown')}` severity")
                             st.write(f"**Clause:** {risk.get('clause', 'N/A')}")
@@ -2170,8 +2214,24 @@ else:
                         st.info(f"**Risk Summary:** Total: {risk_summary.get('total_risks', 0)} | Critical: {risk_summary.get('critical_count', 0)} | High: {risk_summary.get('high_count', 0)} | Medium: {risk_summary.get('medium_count', 0)} | Low: {risk_summary.get('low_count', 0)}")
                 elif s_obj == "Ambiguity Scrutiny" and "ambiguities" in r["result"]:
                     ambs = r["result"]["ambiguities"]
-                    for idx, a in enumerate(ambs):
-                        if not isinstance(a, dict): continue
+                    valid_ambs = [a for a in ambs if isinstance(a, dict)]
+                    # Type/Severity summary
+                    if valid_ambs:
+                        st.markdown("#### 📊 Ambiguity Summary by Type & Severity")
+                        _LEVEL_ORDER = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
+                        atype_counts = collections.Counter(a.get('ambiguity_type', 'Unknown') for a in valid_ambs)
+                        asev_counts = collections.Counter(a.get('severity', 'Medium') for a in valid_ambs)
+                        as_col1, as_col2 = st.columns(2)
+                        with as_col1:
+                            st.markdown("**By Type**")
+                            for t, cnt in sorted(atype_counts.items(), key=lambda x: -x[1]):
+                                st.markdown(f"- {t}: **{cnt}**")
+                        with as_col2:
+                            st.markdown("**By Severity**")
+                            for sev, cnt in sorted(asev_counts.items(), key=lambda x: _LEVEL_ORDER.get(x[0], 99)):
+                                st.markdown(f"- {sev}: **{cnt}**")
+                        st.markdown("---")
+                    for idx, a in enumerate(valid_ambs):
                         with st.container():
                             st.markdown(f"**{idx+1}. {a.get('ambiguity_type', 'Ambiguity')}**")
                             st.write(f"**Issue:** {a.get('issue', 'N/A')}")
@@ -2186,8 +2246,26 @@ else:
                             st.markdown("---")
                 elif s_obj == "Compliance Matrix" and "matrix" in r["result"]:
                     matrix_items = r["result"]["matrix"]
-                    for idx, item in enumerate(matrix_items):
-                        if not isinstance(item, dict): continue
+                    valid_items = [item for item in matrix_items if isinstance(item, dict)]
+                    # Category summary
+                    if valid_items:
+                        st.markdown("#### 📊 Requirements Summary by Category")
+                        cat_counts = collections.Counter(item.get('category', 'Uncategorized') for item in valid_items)
+                        total_reqs = len(valid_items)
+                        mandatory_count = sum(1 for item in valid_items if _resolve_mandatory_val(item.get("mandatory")))
+                        optional_count = total_reqs - mandatory_count
+                        cm_col1, cm_col2 = st.columns(2)
+                        with cm_col1:
+                            st.markdown("**By Category**")
+                            for cat, cnt in sorted(cat_counts.items(), key=lambda x: -x[1]):
+                                st.markdown(f"- {cat}: **{cnt}**")
+                        with cm_col2:
+                            st.markdown("**By Type**")
+                            st.markdown(f"- 🔴 Mandatory: **{mandatory_count}**")
+                            st.markdown(f"- 🟡 Optional: **{optional_count}**")
+                            st.markdown(f"- Total: **{total_reqs}**")
+                        st.markdown("---")
+                    for idx, item in enumerate(valid_items):
                         with st.container():
                             mandatory_badge = "🔴 Mandatory" if _resolve_mandatory_val(item.get("mandatory")) else "🟡 Optional"
                             st.markdown(f"**{idx+1}. {item.get('item', 'Requirement')}** — {mandatory_badge} | Category: `{item.get('category', 'N/A')}`")
@@ -2198,14 +2276,21 @@ else:
                                 st.warning("**Evidence:** Not captured")
                             st.caption(f"Pages: {item.get('pages', [])}")
                             st.markdown("---")
-                    valid_items = [item for item in matrix_items if isinstance(item, dict)]
-                    total_reqs = len(valid_items)
-                    mandatory_count = sum(1 for item in valid_items if _resolve_mandatory_val(item.get("mandatory")))
-                    optional_count = total_reqs - mandatory_count
-                    st.info(f"**Summary:** Mandatory: {mandatory_count} | Optional: {optional_count} | Total Requirements: {total_reqs}")
                 else:
                     df = convert_result_to_dataframe(r["result"], s_obj)
                     if df is not None: st.dataframe(df, use_container_width=True)
+                    # Type/domain summary for General Summary and Overall Summary & Voice
+                    key_findings = r["result"].get("key_findings") or []
+                    valid_kf = [kf for kf in key_findings if isinstance(kf, dict)]
+                    if valid_kf:
+                        st.markdown("#### 📊 Findings Summary")
+                        domain_counts = collections.Counter(kf.get('domain') or kf.get('type') or 'General' for kf in valid_kf)
+                        kf_cols = st.columns(min(len(domain_counts), 4))
+                        for i, (domain, cnt) in enumerate(sorted(domain_counts.items(), key=lambda x: -x[1])):
+                            with kf_cols[i % len(kf_cols)]:
+                                st.markdown(f"- {domain}: **{cnt}**")
+                        st.caption(f"Total findings: **{len(valid_kf)}**")
+                        st.markdown("---")
                     if "summary" in r["result"]: st.info(r["result"]["summary"])
                     if "overall_assessment" in r["result"]: st.success(f"**Overall Assessment:** {r['result']['overall_assessment']}")
 
