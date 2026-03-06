@@ -440,7 +440,13 @@ class VectorStoreRAG:
             self.collection.delete(ids=ids)
         except Exception:
             pass
-        self.collection.add(ids=ids, documents=[d.page_content for d in docs], metadatas=[d.metadata for d in docs], embeddings=embs.tolist())
+        # Deduplicate within the batch to avoid DuplicateIDError when chunks share identical content
+        id_to_doc_emb: dict = {}
+        for id_, doc, emb in zip(ids, docs, embs.tolist()):
+            id_to_doc_emb[id_] = (doc, emb)
+        unique_ids = list(id_to_doc_emb.keys())
+        unique_docs, unique_embs = zip(*[id_to_doc_emb[i] for i in unique_ids]) if unique_ids else ([], [])
+        self.collection.add(ids=unique_ids, documents=[d.page_content for d in unique_docs], metadatas=[d.metadata for d in unique_docs], embeddings=list(unique_embs))
 
 class SparseBM25IndexRAG:
     def __init__(self): self.bm25, self.docs = None, []
