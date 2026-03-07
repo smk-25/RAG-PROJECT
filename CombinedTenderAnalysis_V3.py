@@ -181,6 +181,18 @@ try:
 except Exception:
     BM25Okapi = None
     BM25_AVAILABLE = False
+try:
+    from langchain_community.document_loaders import PyPDFLoader
+    from langchain.text_splitter import RecursiveCharacterTextSplitter
+    LANGCHAIN_PDF_AVAILABLE = True
+except Exception:
+    PyPDFLoader = None
+    RecursiveCharacterTextSplitter = None
+    LANGCHAIN_PDF_AVAILABLE = False
+try:
+    import tiktoken as _tiktoken
+except Exception:
+    _tiktoken = None
 
 # --------------------------
 # Constants
@@ -404,6 +416,35 @@ def load_pdf_with_pymupdf(pdf_path: str) -> List[RAGDocument]:
         st.error(f"Error loading PDF: {e}")
     return docs
 
+def process_pdf(pdf_path: str) -> List[Any]:
+    """Load a PDF using PyPDFLoader (mirrors EnhancedRAG10.3.py logic).
+
+    Adds source_file, file_type, and file_hash metadata to every page document.
+    Falls back to load_pdf_with_pymupdf when PyPDFLoader / langchain is not
+    available in the environment.
+    """
+    if not LANGCHAIN_PDF_AVAILABLE or PyPDFLoader is None:
+        st.write(f"Loading PDF: {Path(pdf_path).name}")
+        return load_pdf_with_pymupdf(pdf_path)
+    st.write(f"Loading PDF: {Path(pdf_path).name}")
+    try:
+        loader = PyPDFLoader(pdf_path)
+        docs = loader.load()
+    except Exception as e:
+        st.error(f"PDF loader error: {e}")
+        return []
+    try:
+        file_hash = sha256_file_shared(pdf_path)
+    except Exception:
+        file_hash = None
+    for d in docs:
+        d.metadata["source_file"] = Path(pdf_path).name
+        d.metadata["file_type"] = "pdf"
+        if file_hash:
+            d.metadata["file_hash"] = file_hash
+    st.write(f"Loaded {len(docs)} pages")
+    return docs
+
 def chunk_recursive_character(docs: List[RAGDocument], chunk_size: int = 800, chunk_overlap: int = 128) -> List[RAGDocument]:
     chunks = []
     for doc in docs:
@@ -463,6 +504,101 @@ def apply_chunking_method(docs: List[RAGDocument], method: str, chunk_size: int 
     elif method == "Hybrid (Token+Semantic)": return chunk_hybrid_token_semantic(docs, chunk_size, chunk_overlap)
     elif method == "Fixed Context Window": return chunk_fixed_context_window(docs, chunk_size)
     return chunk_recursive_character(docs, chunk_size, chunk_overlap)
+
+def split_documents(documents: List[Any], chunk_size: int = 800, chunk_overlap: int = 128, method: str = "Recursive") -> List[Any]:
+    """Split documents using RecursiveCharacterTextSplitter (mirrors EnhancedRAG10.3.py logic).
+
+    Supports method names "Recursive", "Hybrid", and "Fixed-size" (matching
+    EnhancedRAG10.3.py).  Falls back to apply_chunking_method when the langchain
+    text splitter is unavailable.
+    """
+    if not LANGCHAIN_PDF_AVAILABLE or RecursiveCharacterTextSplitter is None:
+        _method_map = {
+            "Recursive": "Recursive Character Splitter",
+            "Hybrid": "Hybrid (Token+Semantic)",
+            "Fixed-size": "Fixed Context Window",
+        }
+        return apply_chunking_method(
+            documents,  # type: ignore[arg-type]
+            _method_map.get(method, "Recursive Character Splitter"),
+            chunk_size,
+            chunk_overlap,
+        )
+
+    # Token-aware length function: uses tiktoken when available, else char/4 estimate
+    if _tiktoken is not None:
+        try:
+            _enc = _tiktoken.get_encoding("cl100k_base")
+            def length_fn(text: str) -> int:
+                return len(_enc.encode(text))
+        except Exception:
+            def length_fn(text: str) -> int:
+                return max(1, len(text) // 4)
+    else:
+        def length_fn(text: str) -> int:
+            return max(1, len(text) // 4)
+
+    if method == "Recursive":
+        st.write(f"Using Recursive chunking strategy (chunk_size={chunk_size}, overlap={chunk_overlap})")
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            length_function=length_fn,
+            separators=["\n\n", "\n", " ", ""]
+        )
+        split_docs = splitter.split_documents(documents)
+        st.write(f"Split into {len(split_docs)} chunks using Recursive method")
+        return split_docs
+
+    elif method == "Hybrid":
+        # Two-pass: first split on paragraph/line boundaries (semantic), then
+        # further split any oversized chunks with overlap (fixed-size).
+        st.write(f"Using Hybrid chunking strategy (chunk_size={chunk_size}, overlap={chunk_overlap})")
+        semantic_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size * 2,
+            chunk_overlap=0,
+            length_function=length_fn,
+            separators=["\n\n", "\n"]
+        )
+        semantic_chunks = semantic_splitter.split_documents(documents)
+        final_chunks: List[Any] = []
+        for doc in semantic_chunks:
+            if length_fn(doc.page_content) > chunk_size:
+                sub_splitter = RecursiveCharacterTextSplitter(
+                    chunk_size=chunk_size,
+                    chunk_overlap=chunk_overlap,
+                    length_function=length_fn,
+                    separators=[" ", ""]
+                )
+                final_chunks.extend(sub_splitter.split_documents([doc]))
+            else:
+                final_chunks.append(doc)
+        st.write(f"Split into {len(final_chunks)} chunks using Hybrid method")
+        return final_chunks
+
+    elif method == "Fixed-size":
+        st.write(f"Using Fixed-size chunking strategy (chunk_size={chunk_size}, overlap={chunk_overlap})")
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            length_function=length_fn,
+            separators=[""]
+        )
+        split_docs = splitter.split_documents(documents)
+        st.write(f"Split into {len(split_docs)} chunks using Fixed-size method")
+        return split_docs
+
+    else:
+        st.warning(f"Unknown chunking method '{method}', defaulting to Recursive")
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            length_function=length_fn,
+            separators=["\n\n", "\n", " ", ""]
+        )
+        split_docs = splitter.split_documents(documents)
+        st.write(f"Split into {len(split_docs)} chunks")
+        return split_docs
 
 # --------------------------
 # RAG Core Components
@@ -1610,7 +1746,7 @@ with st.sidebar:
             crs_m = st.text_input("Cross-Encoder", "cross-encoder/ms-marco-MiniLM-L-6-v2")
             u_crs = st.checkbox("Use Cross-Encoder", True)
             u_spa = st.checkbox("Use Sparse BM25", True)
-            chunk_method = st.selectbox("Chunking Method", ["Recursive Character Splitter", "Hybrid (Token+Semantic)", "Fixed Context Window"])
+            chunk_method = st.selectbox("Chunking Method", ["Recursive", "Hybrid", "Fixed-size"])
             c_size = st.number_input("Chunk size", 800)
             c_over = st.number_input("Overlap", 128)
             max_tk = st.number_input("Context Tokens", 4096)
@@ -1644,50 +1780,64 @@ if choice == "⚡ Simple QA (RAG)":
                     vs = _get_vs()
 
                     st.write("Extracting Text & Metadata...")
-                    all_chunks = []
+                    all_pages = []
                     for f in files:
                         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as t:
                             t.write(f.getbuffer()); t.flush()
                             t_path = t.name
                         try:
-                            h = sha256_file_shared(t_path)
-                            docs = load_pdf_with_pymupdf(t_path)
-                            for d in docs: d.metadata.update({"file_hash": h, "source_file": f.name})
-                            all_chunks.extend(apply_chunking_method(docs, chunk_method, c_size, c_over))
+                            pages = process_pdf(t_path)
+                            # Override source_file with original filename so citations
+                            # reference the user-uploaded file name, not the temp path.
+                            for p in pages:
+                                p.metadata["source_file"] = f.name
+                            if pages:
+                                all_pages.extend(pages)
                         finally:
                             try: os.unlink(t_path)
                             except OSError: pass
 
-                    if not all_chunks:
+                    if not all_pages:
                         st.error("No text could be extracted from the uploaded PDFs. Please check the files and try again.")
                         status.update(label="Indexing Failed", state="error", expanded=True)
                     else:
-                        st.write(f"Generating Embeddings for {len(all_chunks)} chunks...")
-                        if len(all_chunks) > MAX_CHUNKS_WARNING_THRESHOLD:
-                            st.warning(f"⚠️ Large document set detected ({len(all_chunks)} chunks). "
-                                       "Embeddings are generated in batches to limit memory usage.")
-                        texts = [c.page_content for c in all_chunks]
-                        # Encode in fixed-size batches to keep peak memory bounded,
-                        # mirroring the approach in EnhancedRAG10.3.py.
-                        emb_batches = [em.generate_embeddings(texts[i:i + EMBEDDING_BATCH_SIZE])
-                                       for i in range(0, len(texts), EMBEDDING_BATCH_SIZE)]
-                        embs = np.vstack(emb_batches) if emb_batches else np.zeros((0, DEFAULT_EMBEDDING_DIM), dtype=np.float32)
-                        del emb_batches, texts
+                        chunks = split_documents(all_pages, chunk_size=int(c_size), chunk_overlap=int(c_over), method=chunk_method)
+                        del all_pages
 
-                        vs.add_documents(all_chunks, embs)
-                        del embs
+                        if not chunks:
+                            st.error("No chunks generated. Please try different chunking settings.")
+                            status.update(label="Indexing Failed", state="error", expanded=True)
+                        else:
+                            st.write(f"Generating Embeddings for {len(chunks)} chunks...")
+                            if len(chunks) > MAX_CHUNKS_WARNING_THRESHOLD:
+                                st.warning(f"⚠️ Large document set detected ({len(chunks)} chunks). "
+                                           "Embeddings are generated in batches to limit memory usage.")
+                            texts = [d.page_content for d in chunks]
+                            emb_batches = []
+                            for i in range(0, len(texts), EMBEDDING_BATCH_SIZE):
+                                emb = em.generate_embeddings(texts[i:i + EMBEDDING_BATCH_SIZE])
+                                emb_batches.append(emb)
+                            all_emb = np.vstack(emb_batches) if emb_batches else np.zeros((0, DEFAULT_EMBEDDING_DIM), dtype=np.float32)
+                            del emb_batches, texts
 
-                        st.session_state["rvs_v2"], st.session_state["sem_v2"] = vs, em
+                            if all_emb.size == 0:
+                                st.error("Embeddings generation failed.")
+                                status.update(label="Indexing Failed", state="error", expanded=True)
+                            else:
+                                vs.add_documents(chunks, all_emb)
+                                del all_emb
 
-                        if u_spa and BM25_AVAILABLE:
-                            st.write("Building Sparse BM25 Index...")
-                            bm = SparseBM25IndexRAG(); bm.build(all_chunks)
-                            st.session_state["rbm_v2"] = bm
+                                st.session_state["rvs_v2"], st.session_state["sem_v2"] = vs, em
 
-                        del all_chunks
+                                if u_spa and BM25_AVAILABLE:
+                                    st.write("Building Sparse BM25 Index...")
+                                    bm = SparseBM25IndexRAG(); bm.build(chunks)
+                                    st.session_state["rbm_v2"] = bm
 
-                        st.write("Success!")
-                        status.update(label="Index Complete!", state="complete", expanded=False)
+                                del chunks
+
+                                st.write("Success!")
+                                status.update(label="Index Complete!", state="complete", expanded=False)
                 except Exception as e:
                     st.error(f"Indexing failed. Please check your documents and try again. (Details: {e})")
                     status.update(label="Indexing Failed", state="error", expanded=True)
