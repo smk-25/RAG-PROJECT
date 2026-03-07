@@ -1612,17 +1612,28 @@ with st.sidebar:
 if choice == "⚡ Simple QA (RAG)":
     st.markdown('<div class="app-header"><h1>⚡ Tender QA (RAG Mode)</h1><p>Ask specific questions about your tender documents with precise citations.</p></div>', unsafe_allow_html=True)
     files = st.file_uploader("Upload Tender PDFs", type="pdf", accept_multiple_files=True)
-    
+
+    # Define cached manager helpers outside the button handler so they are
+    # available on every Streamlit rerun (same pattern as EnhancedRAG10.3.py).
+    # @st.cache_resource guarantees the heavy objects – model weights and the
+    # ChromaDB HNSW index – are built only once per server lifetime.
+    @st.cache_resource
+    def _get_em(name): return EmbeddingManagerRAG(name)
+    @st.cache_resource
+    def _get_vs(): return VectorStoreRAG()
+
     if files:
         if st.button("🚀 Index Documents", use_container_width=True):
             with st.status("Indexing Documents...", expanded=True) as status:
+                em = _get_em(emb_m)
+                vs = _get_vs()
+
                 st.write("Extracting Text & Metadata...")
-                em = EmbeddingManagerRAG(emb_m); vs = VectorStoreRAG(); all_chunks = []
+                all_chunks = []
                 for f in files:
                     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as t:
                         t.write(f.getbuffer()); t.flush()
                         t_path = t.name
-                    
                     try:
                         h = sha256_file_shared(t_path)
                         docs = load_pdf_with_pymupdf(t_path)
@@ -1631,24 +1642,31 @@ if choice == "⚡ Simple QA (RAG)":
                     finally:
                         try: os.unlink(t_path)
                         except: pass
-                
+
                 st.write(f"Generating Embeddings for {len(all_chunks)} chunks...")
                 if len(all_chunks) > MAX_CHUNKS_WARNING_THRESHOLD:
                     st.warning(f"⚠️ Large document set detected ({len(all_chunks)} chunks). "
                                "Embeddings are generated in batches to limit memory usage.")
                 texts = [c.page_content for c in all_chunks]
-                embs = em.generate_embeddings(texts)
+                # Encode in fixed-size batches to keep peak memory bounded,
+                # mirroring the approach in EnhancedRAG10.3.py.
+                emb_batches = [em.generate_embeddings(texts[i:i + EMBEDDING_BATCH_SIZE])
+                               for i in range(0, len(texts), EMBEDDING_BATCH_SIZE)]
+                embs = np.vstack(emb_batches) if emb_batches else np.zeros((0, DEFAULT_EMBEDDING_DIM), dtype=np.float32)
+                del emb_batches, texts
+
                 vs.add_documents(all_chunks, embs)
+                del embs
+
                 st.session_state["rvs_v2"], st.session_state["sem_v2"] = vs, em
-                
+
                 if u_spa and BM25_AVAILABLE:
                     st.write("Building Sparse BM25 Index...")
                     bm = SparseBM25IndexRAG(); bm.build(all_chunks)
                     st.session_state["rbm_v2"] = bm
-                
-                # Release large intermediate arrays to free memory promptly
-                del texts, embs, all_chunks
-                
+
+                del all_chunks
+
                 st.write("Success!")
                 status.update(label="Index Complete!", state="complete", expanded=False)
 
