@@ -253,6 +253,19 @@ def load_cross_encoder_cached(model_name: str):
     except Exception:
         return None
 
+@st.cache_resource
+def get_vector_store_rag_cached(
+    collection_name: str = "rag_qa_documents",
+    path: str = "./vector_store_rag",
+) -> "VectorStoreRAG":
+    """Return a single cached VectorStoreRAG instance.
+
+    Re-using the same ChromaDB PersistentClient across button clicks avoids
+    re-loading the in-memory HNSW index on every 'Index Documents' press,
+    which was the primary cause of excess memory usage in Simple QA mode.
+    """
+    return VectorStoreRAG(collection_name=collection_name, path=path)
+
 # Shared Utils
 def sha256_text_shared(text: str) -> str:
     return hashlib.sha256((text or "").strip().encode("utf-8")).hexdigest()
@@ -1617,38 +1630,58 @@ if choice == "⚡ Simple QA (RAG)":
         if st.button("🚀 Index Documents", use_container_width=True):
             with st.status("Indexing Documents...", expanded=True) as status:
                 st.write("Extracting Text & Metadata...")
-                em = EmbeddingManagerRAG(emb_m); vs = VectorStoreRAG(); all_chunks = []
+                em = EmbeddingManagerRAG(emb_m)
+                # Reuse a single cached ChromaDB client to avoid re-loading the
+                # in-memory HNSW index on every button press (key memory fix).
+                vs = get_vector_store_rag_cached()
+                # Purge stale chunks from previous index runs so we start clean.
+                try:
+                    old_ids = vs.collection.get(include=[])["ids"]
+                    if old_ids:
+                        vs.collection.delete(ids=old_ids)
+                except Exception:
+                    pass
+                # all_chunks is kept (text only, no embeddings) for BM25 index.
+                all_chunks = []
                 for f in files:
                     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as t:
                         t.write(f.getbuffer()); t.flush()
                         t_path = t.name
-                    
+
                     try:
                         h = sha256_file_shared(t_path)
                         docs = load_pdf_with_pymupdf(t_path)
                         for d in docs: d.metadata.update({"file_hash": h, "source_file": f.name})
-                        all_chunks.extend(apply_chunking_method(docs, chunk_method, c_size, c_over))
+                        file_chunks = apply_chunking_method(docs, chunk_method, c_size, c_over)
+                        del docs  # free page-level objects before generating embeddings
                     finally:
                         try: os.unlink(t_path)
                         except: pass
-                
-                st.write(f"Generating Embeddings for {len(all_chunks)} chunks...")
-                if len(all_chunks) > MAX_CHUNKS_WARNING_THRESHOLD:
-                    st.warning(f"⚠️ Large document set detected ({len(all_chunks)} chunks). "
-                               "Embeddings are generated in batches to limit memory usage.")
-                texts = [c.page_content for c in all_chunks]
-                embs = em.generate_embeddings(texts)
-                vs.add_documents(all_chunks, embs)
+
+                    if file_chunks:
+                        if len(file_chunks) > MAX_CHUNKS_WARNING_THRESHOLD:
+                            st.warning(f"⚠️ Large file detected ({len(file_chunks)} chunks for {f.name}). "
+                                       "Embeddings are generated in batches to limit memory usage.")
+                        st.write(f"Generating embeddings for {f.name} ({len(file_chunks)} chunks)...")
+                        # Generate and store embeddings one file at a time so we
+                        # never hold a giant embedding matrix for all files in RAM.
+                        file_texts = [c.page_content for c in file_chunks]
+                        file_embs = em.generate_embeddings(file_texts)
+                        vs.add_documents(file_chunks, file_embs)
+                        del file_texts, file_embs  # release immediately after storing to ChromaDB
+
+                    all_chunks.extend(file_chunks)
+
                 st.session_state["rvs_v2"], st.session_state["sem_v2"] = vs, em
-                
+
                 if u_spa and BM25_AVAILABLE:
                     st.write("Building Sparse BM25 Index...")
                     bm = SparseBM25IndexRAG(); bm.build(all_chunks)
                     st.session_state["rbm_v2"] = bm
-                
-                # Release large intermediate arrays to free memory promptly
-                del texts, embs, all_chunks
-                
+
+                # Release the text-only chunk list now that BM25 is built.
+                del all_chunks
+
                 st.write("Success!")
                 status.update(label="Index Complete!", state="complete", expanded=False)
 
