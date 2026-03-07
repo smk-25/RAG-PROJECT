@@ -253,6 +253,26 @@ def load_cross_encoder_cached(model_name: str):
     except Exception:
         return None
 
+@st.cache_resource
+def _get_em(name: str):
+    """Return a cached EmbeddingManagerRAG for the given model name.
+
+    Defined at module level so @st.cache_resource can correctly identify and
+    reuse the cached resource across Streamlit reruns.  Defining this inside a
+    conditional block caused a new function object (and therefore a new cache
+    entry and a new ChromaDB client) to be created on every rerun, leading to
+    SQLite database-lock errors during document indexing.
+    """
+    return EmbeddingManagerRAG(name)
+
+@st.cache_resource
+def _get_vs():
+    """Return a cached VectorStoreRAG instance.
+
+    Must live at module level for the same reason as _get_em above.
+    """
+    return VectorStoreRAG()
+
 # Shared Utils
 def sha256_text_shared(text: str) -> str:
     return hashlib.sha256((text or "").strip().encode("utf-8")).hexdigest()
@@ -1613,62 +1633,64 @@ if choice == "⚡ Simple QA (RAG)":
     st.markdown('<div class="app-header"><h1>⚡ Tender QA (RAG Mode)</h1><p>Ask specific questions about your tender documents with precise citations.</p></div>', unsafe_allow_html=True)
     files = st.file_uploader("Upload Tender PDFs", type="pdf", accept_multiple_files=True)
 
-    # Define cached manager helpers outside the button handler so they are
-    # available on every Streamlit rerun (same pattern as EnhancedRAG10.3.py).
-    # @st.cache_resource guarantees the heavy objects – model weights and the
-    # ChromaDB HNSW index – are built only once per server lifetime.
-    @st.cache_resource
-    def _get_em(name): return EmbeddingManagerRAG(name)
-    @st.cache_resource
-    def _get_vs(): return VectorStoreRAG()
+    # _get_em and _get_vs are defined at module level so @st.cache_resource
+    # correctly identifies and reuses them across Streamlit reruns.
 
     if files:
         if st.button("🚀 Index Documents", use_container_width=True):
             with st.status("Indexing Documents...", expanded=True) as status:
-                em = _get_em(emb_m)
-                vs = _get_vs()
+                try:
+                    em = _get_em(emb_m)
+                    vs = _get_vs()
 
-                st.write("Extracting Text & Metadata...")
-                all_chunks = []
-                for f in files:
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as t:
-                        t.write(f.getbuffer()); t.flush()
-                        t_path = t.name
-                    try:
-                        h = sha256_file_shared(t_path)
-                        docs = load_pdf_with_pymupdf(t_path)
-                        for d in docs: d.metadata.update({"file_hash": h, "source_file": f.name})
-                        all_chunks.extend(apply_chunking_method(docs, chunk_method, c_size, c_over))
-                    finally:
-                        try: os.unlink(t_path)
-                        except: pass
+                    st.write("Extracting Text & Metadata...")
+                    all_chunks = []
+                    for f in files:
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as t:
+                            t.write(f.getbuffer()); t.flush()
+                            t_path = t.name
+                        try:
+                            h = sha256_file_shared(t_path)
+                            docs = load_pdf_with_pymupdf(t_path)
+                            for d in docs: d.metadata.update({"file_hash": h, "source_file": f.name})
+                            all_chunks.extend(apply_chunking_method(docs, chunk_method, c_size, c_over))
+                        finally:
+                            try: os.unlink(t_path)
+                            except OSError: pass
 
-                st.write(f"Generating Embeddings for {len(all_chunks)} chunks...")
-                if len(all_chunks) > MAX_CHUNKS_WARNING_THRESHOLD:
-                    st.warning(f"⚠️ Large document set detected ({len(all_chunks)} chunks). "
-                               "Embeddings are generated in batches to limit memory usage.")
-                texts = [c.page_content for c in all_chunks]
-                # Encode in fixed-size batches to keep peak memory bounded,
-                # mirroring the approach in EnhancedRAG10.3.py.
-                emb_batches = [em.generate_embeddings(texts[i:i + EMBEDDING_BATCH_SIZE])
-                               for i in range(0, len(texts), EMBEDDING_BATCH_SIZE)]
-                embs = np.vstack(emb_batches) if emb_batches else np.zeros((0, DEFAULT_EMBEDDING_DIM), dtype=np.float32)
-                del emb_batches, texts
+                    if not all_chunks:
+                        st.error("No text could be extracted from the uploaded PDFs. Please check the files and try again.")
+                        status.update(label="Indexing Failed", state="error", expanded=True)
+                    else:
+                        st.write(f"Generating Embeddings for {len(all_chunks)} chunks...")
+                        if len(all_chunks) > MAX_CHUNKS_WARNING_THRESHOLD:
+                            st.warning(f"⚠️ Large document set detected ({len(all_chunks)} chunks). "
+                                       "Embeddings are generated in batches to limit memory usage.")
+                        texts = [c.page_content for c in all_chunks]
+                        # Encode in fixed-size batches to keep peak memory bounded,
+                        # mirroring the approach in EnhancedRAG10.3.py.
+                        emb_batches = [em.generate_embeddings(texts[i:i + EMBEDDING_BATCH_SIZE])
+                                       for i in range(0, len(texts), EMBEDDING_BATCH_SIZE)]
+                        embs = np.vstack(emb_batches) if emb_batches else np.zeros((0, DEFAULT_EMBEDDING_DIM), dtype=np.float32)
+                        del emb_batches, texts
 
-                vs.add_documents(all_chunks, embs)
-                del embs
+                        vs.add_documents(all_chunks, embs)
+                        del embs
 
-                st.session_state["rvs_v2"], st.session_state["sem_v2"] = vs, em
+                        st.session_state["rvs_v2"], st.session_state["sem_v2"] = vs, em
 
-                if u_spa and BM25_AVAILABLE:
-                    st.write("Building Sparse BM25 Index...")
-                    bm = SparseBM25IndexRAG(); bm.build(all_chunks)
-                    st.session_state["rbm_v2"] = bm
+                        if u_spa and BM25_AVAILABLE:
+                            st.write("Building Sparse BM25 Index...")
+                            bm = SparseBM25IndexRAG(); bm.build(all_chunks)
+                            st.session_state["rbm_v2"] = bm
 
-                del all_chunks
+                        del all_chunks
 
-                st.write("Success!")
-                status.update(label="Index Complete!", state="complete", expanded=False)
+                        st.write("Success!")
+                        status.update(label="Index Complete!", state="complete", expanded=False)
+                except Exception as e:
+                    st.error(f"Indexing failed. Please check your documents and try again. (Details: {e})")
+                    status.update(label="Indexing Failed", state="error", expanded=True)
 
     if "rvs_v2" in st.session_state:
         # Question input area
