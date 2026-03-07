@@ -1848,11 +1848,7 @@ if choice == "⚡ Simple QA (RAG)":
         
         # Move display options to main area for better visibility
         with st.expander("🛠️ Result Display Options", expanded=True):
-            col1, col2, col3, col4 = st.columns(4)
-            with col1: use_qe = st.checkbox("Query Expansion", True, help="Generate multiple queries for better retrieval")
-            with col2: use_av = st.checkbox("Answer Validation", True, help="LLM-based grounding check")
-            with col3: show_cl = st.checkbox("Clause Citations", True, help="Map answer to specific document clauses")
-            with col4: show_sc = st.checkbox("Sentence Citations", True, help="Map answer to specific source sentences")
+            use_qe = st.checkbox("Query Expansion", True, help="Generate multiple queries for better retrieval")
 
         if q:
             if not ga_key: st.error("Groq API Key Mandatory"); st.stop()
@@ -1881,35 +1877,6 @@ if choice == "⚡ Simple QA (RAG)":
             st.subheader("💡 Analysis Result")
             st.write(strip_provenance(ans))
             st.markdown('</div>', unsafe_allow_html=True)
-            
-            # Confidence & Metrics
-            supp = compute_mean_support_score_shared(res)
-            render_metric_cards(len(res), t_total, supp)
-            
-            tab1, tab2, tab3 = st.tabs(["📚 Evidence Chunks", "📋 Precise Citations", "✅ Validation"])
-            with tab1:
-                for i, c in enumerate(res):
-                    with st.expander(f"Chunk {i+1} | Score: {c.get('similarity_score',0.0):.3f} | Page: {c['metadata'].get('page')}"):
-                        st.text(c['content'])
-            with tab2:
-                if show_cl:
-                    st.markdown("#### 📑 Clause-Level Citations")
-                    c_map = map_answer_to_clauses_rag(strip_provenance(ans), used, st.session_state["sem_v2"])
-                    if not c_map: st.info("No clause-level matches found.")
-                    for m in c_map: st.caption(f"**{m['answer_sentence']}** → *{m['source_file']} P{m['page']}*"); st.write(f"> {m['source_clause']}")
-                
-                if show_sc:
-                    st.markdown("#### 📝 Sentence-Level Citations")
-                    s_map = map_sentences_to_sources_rag(strip_provenance(ans), used, st.session_state["sem_v2"])
-                    if not s_map: st.info("No sentence-level matches found.")
-                    for m in s_map: st.caption(f"**{m['answer_sentence']}** → *{m['source_file']} P{m['page']}*"); st.write(f"> {m['source_sentence']}")
-            with tab3:
-                if use_av:
-                    is_v, msg = llm.validate_answer(q, ans, ctx)
-                    if is_v:
-                        st.success(msg)
-                    else:
-                        st.warning(msg)
 
 # --------------------------
 # Summarization Execution
