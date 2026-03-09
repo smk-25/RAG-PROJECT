@@ -2,6 +2,7 @@
 # Modernized Version with Professional UI/UX
 import os
 import re
+import gc
 import time
 import json
 import uuid
@@ -886,7 +887,13 @@ class TokenBucket:
 
     async def wait(self):
         async with self.lock:
-            now = asyncio.get_event_loop().time()
+            # Use time.monotonic() instead of asyncio.get_event_loop().time() so
+            # that self.last_call stays consistent across asyncio.run() restarts.
+            # loop.time() resets to near-zero on each new event loop, which caused
+            # self.last_call (from the previous run) to be far in the "future"
+            # relative to the new loop — resulting in forced 60-second sleeps on
+            # every API call in subsequent analysis runs.
+            now = time.monotonic()
             if self.last_call < now:
                 self.last_call = now
             wait_time = (self.last_call + self.spacing) - now
@@ -899,7 +906,7 @@ class TokenBucket:
     async def report_429(self, wait_sec: float):
         """Global push-back when a 429 is received."""
         async with self.lock:
-            now = asyncio.get_event_loop().time()
+            now = time.monotonic()
             self.last_call = max(self.last_call, now + wait_sec)
             try:
                 st.session_state["api_backoff_until"] = time.time() + wait_sec
@@ -1931,6 +1938,8 @@ else:
                     p, fl = extract_pages_sum(t.name); all_p.extend(p); all_f.extend(fl)
             st.write(f"Chunking {len(all_p)} pages...")
             chunks = semantic_chunk_pages_sum(all_p, all_f, max_tok=s_max_tk, overlap=s_over)
+            # Free raw page text — no longer needed once chunks are built.
+            del all_p, all_f
             
             async def run_sum_v2():
                 ms, mi, rs, ri = get_sum_prompts(s_obj)
@@ -1953,10 +1962,35 @@ else:
                     # all other concurrent tasks (mirrors Summarizationcode.py reduce phase).
                     mapped_batches = await asyncio.gather(*m_tasks, return_exceptions=True); t_m = time.time()
                     mapped = []
-                    for b in mapped_batches:
+                    failed_batch_indices = []
+                    for bi, b in enumerate(mapped_batches):
                         if isinstance(b, Exception):
+                            failed_batch_indices.append(bi)
                             continue  # skip failed batches, keep results from the rest
                         mapped.extend(_unwrap_batch_result(b, s_obj))
+                    # Free task list and raw results now that findings are extracted.
+                    del m_tasks, mapped_batches
+
+                    # For Compliance Matrix: retry ALL failed batches sequentially so
+                    # that evidence from every page of the document is captured.
+                    # Partial batch failures (e.g. a single 429) would otherwise leave
+                    # entire page ranges unanalysed, causing the matrix to cover only a
+                    # fraction of the document.
+                    if s_obj == "Compliance Matrix" and failed_batch_indices:
+                        st.write(f"Retrying {len(failed_batch_indices)} failed batch(es) for complete compliance coverage...")
+                        for fi in failed_batch_indices:
+                            retry_payload = "\n\n".join(
+                                f"---\nID:{c['id']} P:{_chunk_page_label(c)}\nText: {c['text']}"
+                                for c in batches[fi]
+                            )
+                            retry_result = await call_gemini_json_sum_async(
+                                client, ms,
+                                f"{mi}\nQ:{q}\nContext Data:\n{retry_payload}",
+                                s_model, s_rpm
+                            )
+                            recovered = _unwrap_batch_result(retry_result, s_obj)
+                            if recovered:
+                                mapped.extend(recovered)
 
                     # Recovery: if all map batches returned no items (e.g. all failed or LLM
                     # returned empty arrays), attempt direct extraction on each remaining batch
@@ -2031,6 +2065,37 @@ else:
                             if "page" in item and "pages" not in item:
                                 item["pages"] = [item["page"]]
                         red["ambiguities"] = fallback_ambiguities
+                    # Fallback: if the reduce step returned an empty/missing dashboard, an error,
+                    # or a non-dict response but the map step did find entities, build the dashboard
+                    # directly from the mapped flat list grouped by category.
+                    # Also triggers when the dashboard exists but every category list is empty
+                    # (e.g. the LLM excluded all entities because evidence was missing).
+                    if s_obj == "Entity Dashboard" and mapped and (
+                        not isinstance(red, dict)
+                        or not red.get("dashboard")
+                        or not any(isinstance(v, list) and v for v in red.get("dashboard", {}).values())
+                    ):
+                        if not isinstance(red, dict):
+                            red = {}
+                        red.pop("error", None)
+                        rebuilt_dashboard: dict = {}
+                        for m in mapped:
+                            if isinstance(m, dict) and not m.get("error"):
+                                cat = m.get("category", "General")
+                                if cat not in rebuilt_dashboard:
+                                    rebuilt_dashboard[cat] = []
+                                pg = m.get("page")
+                                rebuilt_dashboard[cat].append({
+                                    "entity": m.get("entity", ""),
+                                    "context": m.get("context", ""),
+                                    "evidence": m.get("evidence", ""),
+                                    "pages": (
+                                        m["pages"] if isinstance(m.get("pages"), list)
+                                        else ([pg] if pg else [])
+                                    ),
+                                })
+                        if rebuilt_dashboard:
+                            red["dashboard"] = rebuilt_dashboard
                     # Normalize reduce-step matrix items to canonical key names so
                     # downstream display code always sees 'item', 'detail', 'mandatory', etc.
                     if s_obj == "Compliance Matrix" and isinstance(red, dict) and red.get("matrix"):
@@ -2295,7 +2360,30 @@ else:
                     res.append({"query":q, "result":red, "map_t":t_m-t0, "red_t":time.time()-t_m, "mapped":mapped, "total_t":time.time()-t0, "chunk_count": len(chunks)})
                 return res
             
-            final_res = asyncio.run(run_sum_v2())
+            # Use a fresh event loop for every analysis run to avoid stale asyncio
+            # state between successive objective completions without a page reload.
+            # asyncio.run() is NOT used here because in some Streamlit/Python
+            # configurations the script may run inside an already-running event
+            # loop, causing RuntimeError.  Creating an explicit new loop guarantees
+            # a clean slate regardless of Streamlit's internal async state.
+            _analysis_loop = asyncio.new_event_loop()
+            _analysis_exc = None
+            try:
+                asyncio.set_event_loop(_analysis_loop)
+                final_res = _analysis_loop.run_until_complete(run_sum_v2())
+            except Exception as _e:
+                _analysis_exc = _e
+                final_res = []
+            finally:
+                try:
+                    _analysis_loop.close()
+                except Exception:
+                    pass
+                asyncio.set_event_loop(asyncio.new_event_loop())
+            if _analysis_exc is not None:
+                status.update(label="Analysis Failed!", state="error", expanded=False)
+                st.error(f"Analysis failed: {_analysis_exc}. Please try again — no page reload needed.")
+                st.stop()
             status.update(label="Analysis Complete!", state="complete", expanded=False)
 
         for r in final_res:
@@ -2545,3 +2633,10 @@ else:
         for tf in temp_files:
             try: os.unlink(tf)
             except: pass
+        # Free large in-memory objects once display is complete to reduce
+        # Streamlit's working-set memory before the next analysis run.
+        if 'chunks' in locals():
+            del chunks
+        if 'final_res' in locals():
+            del final_res
+        gc.collect()
