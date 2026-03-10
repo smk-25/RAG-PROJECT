@@ -1125,43 +1125,48 @@ async def _hierarchical_reduce(client, rs, ri, q, mapped, s_model, s_rpm, s_obj)
     would lead to truncated responses, missing page references, and low
     citation-confidence scores.
     """
-    if len(mapped) <= REDUCE_BATCH_THRESHOLD:
+    try:
+        if len(mapped) <= REDUCE_BATCH_THRESHOLD:
+            return await call_gemini_json_sum_async(
+                client, rs, f"{ri}\nQ:{q}\nD:{json.dumps(mapped)}", s_model, s_rpm
+            )
+
+        batches = [
+            mapped[i:i + REDUCE_BATCH_THRESHOLD]
+            for i in range(0, len(mapped), REDUCE_BATCH_THRESHOLD)
+        ]
+        intermediate_items: list = []
+
+        for batch_num, batch in enumerate(batches, start=1):
+            st.write(f"  Reducing batch {batch_num}/{len(batches)} ({len(batch)} items)...")
+            batch_red = await call_gemini_json_sum_async(
+                client, rs,
+                f"{ri}\nQ:{q}\nD:{json.dumps(batch)}",
+                s_model, s_rpm,
+            )
+            extracted = _extract_reduce_items(batch_red, s_obj)
+            if extracted:
+                intermediate_items.extend(extracted)
+            elif isinstance(batch_red, dict) and not batch_red.get("error"):
+                # Reduce returned a non-empty dict but items couldn't be extracted;
+                # fall back to raw batch findings so nothing is silently dropped.
+                intermediate_items.extend(batch)
+
+        if not intermediate_items:
+            # All batch reduces failed; use raw mapped items so the final reduce
+            # still has something to work with.
+            intermediate_items = list(mapped)
+
+        st.write(f"  Final merge reduce of {len(intermediate_items)} consolidated items...")
         return await call_gemini_json_sum_async(
-            client, rs, f"{ri}\nQ:{q}\nD:{json.dumps(mapped)}", s_model, s_rpm
-        )
-
-    batches = [
-        mapped[i:i + REDUCE_BATCH_THRESHOLD]
-        for i in range(0, len(mapped), REDUCE_BATCH_THRESHOLD)
-    ]
-    intermediate_items: list = []
-
-    for batch_num, batch in enumerate(batches, start=1):
-        st.write(f"  Reducing batch {batch_num}/{len(batches)} ({len(batch)} items)...")
-        batch_red = await call_gemini_json_sum_async(
             client, rs,
-            f"{ri}\nQ:{q}\nD:{json.dumps(batch)}",
+            f"{ri}\nQ:{q}\nD:{json.dumps(intermediate_items)}",
             s_model, s_rpm,
         )
-        extracted = _extract_reduce_items(batch_red, s_obj)
-        if extracted:
-            intermediate_items.extend(extracted)
-        elif isinstance(batch_red, dict) and not batch_red.get("error"):
-            # Reduce returned a non-empty dict but items couldn't be extracted;
-            # fall back to raw batch findings so nothing is silently dropped.
-            intermediate_items.extend(batch)
-
-    if not intermediate_items:
-        # All batch reduces failed; use raw mapped items so the final reduce
-        # still has something to work with.
-        intermediate_items = list(mapped)
-
-    st.write(f"  Final merge reduce of {len(intermediate_items)} consolidated items...")
-    return await call_gemini_json_sum_async(
-        client, rs,
-        f"{ri}\nQ:{q}\nD:{json.dumps(intermediate_items)}",
-        s_model, s_rpm,
-    )
+    except Exception as exc:
+        # Return an error dict rather than propagating; the caller's fallback
+        # logic will rebuild the result from the raw mapped items.
+        return {"error": f"Reduce phase error: {exc}"}
 
 
 def extract_pages_sum(path):
@@ -1530,12 +1535,16 @@ def _normalize_compliance_item(entry: dict) -> dict | None:
     """
     if not isinstance(entry, dict) or "error" in entry:
         return None
-    item_text = (
+    # Use str() to guard against the LLM returning numeric or other non-string
+    # values for text fields (e.g. "item": 1).  Without str(), the chained
+    # `or ""` expression evaluates to the truthy non-string value and the
+    # subsequent .strip() call raises AttributeError, crashing the reduce phase.
+    item_text = str(
         entry.get("item") or entry.get("requirement") or entry.get("compliance_item")
         or entry.get("name") or entry.get("clause") or entry.get("topic")
         or entry.get("requirement_name") or ""
     ).strip()
-    detail_text = (
+    detail_text = str(
         entry.get("detail") or entry.get("description") or entry.get("details")
         or entry.get("specifics") or entry.get("content") or ""
     ).strip()
@@ -1548,8 +1557,8 @@ def _normalize_compliance_item(entry: dict) -> dict | None:
     return {
         "item": item_text or detail_text[:_MAX_FALLBACK_ITEM_LENGTH],
         "detail": detail_text,
-        "evidence": entry.get("evidence", ""),
-        "category": entry.get("category") or entry.get("type") or "General",
+        "evidence": str(entry.get("evidence") or ""),
+        "category": str(entry.get("category") or entry.get("type") or "General"),
         "mandatory": _resolve_mandatory_val(mandatory_raw),
         "pages": (
             entry.get("pages") if isinstance(entry.get("pages"), list)
@@ -2201,17 +2210,17 @@ else:
                                 ev = m.get("evidence") or ""
                                 if ev:
                                     if m.get("item"):
-                                        mapped_evidence_by_item[m["item"].lower().strip()] = ev
+                                        mapped_evidence_by_item[str(m["item"]).lower().strip()] = ev
                                     if m.get("detail"):
-                                        dk = m["detail"].lower().strip()[:80]
+                                        dk = str(m["detail"]).lower().strip()[:80]
                                         if dk:
                                             mapped_evidence_by_detail[dk] = ev
                                 elif m.get("detail") and m.get("item"):
                                     # fallback: store detail text for last-resort recovery
-                                    mapped_fallback_by_item[m["item"].lower().strip()] = m["detail"]
+                                    mapped_fallback_by_item[str(m["item"]).lower().strip()] = str(m["detail"])
                         for entry in red.get("matrix", []):
                             if isinstance(entry, dict) and not entry.get("evidence"):
-                                item_key = entry.get("item", "").lower().strip()
+                                item_key = str(entry.get("item") or "").lower().strip()
                                 # Strategy 1: substring match on item name
                                 for mk, mv in mapped_evidence_by_item.items():
                                     if item_key and (item_key in mk or mk in item_key):
@@ -2219,7 +2228,7 @@ else:
                                         break
                                 # Strategy 2: match on detail field
                                 if not entry.get("evidence"):
-                                    detail_key = entry.get("detail", "").lower().strip()[:80]
+                                    detail_key = str(entry.get("detail") or "").lower().strip()[:80]
                                     for dk, dv in mapped_evidence_by_detail.items():
                                         if detail_key and len(detail_key) > 10 and (detail_key in dk or dk in detail_key):
                                             entry["evidence"] = dv
@@ -2250,7 +2259,7 @@ else:
                                 # Strategy 5: search original chunk texts as last resort
                                 if not entry.get("evidence") and chunks:
                                     stop_words = {"the", "a", "an", "of", "in", "to", "for", "and", "or", "is", "are", "will", "shall", "be", "at", "by"}
-                                    search_words = (set(item_key.split()) | set(entry.get("detail", "").lower().split())) - stop_words
+                                    search_words = (set(item_key.split()) | set(str(entry.get("detail") or "").lower().split())) - stop_words
                                     search_words = {w for w in search_words if len(w) > 3}
                                     best_chunk, best_score = None, 0
                                     for chunk in chunks:
@@ -2446,6 +2455,24 @@ else:
                                                 entry["evidence"] = best_sent.strip()
                                         except Exception:
                                             pass
+                    # Safety guard: ensure red is always a dict so the display
+                    # code (which calls red.get(...)) never raises AttributeError.
+                    # This can happen when the LLM returns a bare JSON array
+                    # and mapped is empty (so the mode-specific fallbacks above
+                    # did not trigger).
+                    if not isinstance(red, dict):
+                        if isinstance(red, list) and s_obj == "Compliance Matrix":
+                            # Attempt to salvage a bare-list reduce result as a matrix.
+                            valid = [
+                                n for n in (
+                                    _normalize_compliance_item(item)
+                                    for item in red
+                                    if isinstance(item, dict)
+                                ) if n is not None
+                            ]
+                            red = {"matrix": valid}
+                        else:
+                            red = {}
                     res.append({"query":q, "result":red, "map_t":t_m-t0, "red_t":time.time()-t_m, "mapped":mapped, "total_t":time.time()-t0, "chunk_count": len(chunks)})
                 return res
             
