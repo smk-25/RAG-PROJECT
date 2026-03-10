@@ -231,6 +231,7 @@ CLAUSE_PATTERNS = [
 EMBEDDING_BATCH_SIZE = 64          # Encode in batches to limit peak memory
 MAX_CITATION_SENTENCES = 50        # Cap sentences fed into citation embedding pass
 MAX_CHUNKS_WARNING_THRESHOLD = 1500  # Warn user when chunk count is very high
+REDUCE_BATCH_THRESHOLD = 50        # Max findings before switching to hierarchical reduce
 
 # --------------------------
 # Initialization
@@ -1075,6 +1076,93 @@ async def call_gemini_json_sum_async(client, sys, user, model, rpm):
             await asyncio.sleep(backoff + random.random())
             backoff *= 1.5
     return {"error": "max_retries_exceeded"}
+
+
+def _extract_reduce_items(red: dict, s_obj: str) -> list:
+    """Extract the list of findings from an intermediate reduce result dict.
+
+    Used by _hierarchical_reduce to collect items from each batch-reduce
+    response before the final consolidation pass.
+    """
+    if not isinstance(red, dict) or red.get("error"):
+        return []
+    key_map = {
+        "Compliance Matrix": "matrix",
+        "Risk Assessment": "risks",
+        "Ambiguity Scrutiny": "ambiguities",
+    }
+    key = key_map.get(s_obj)
+    if key:
+        val = red.get(key)
+        return val if isinstance(val, list) else []
+    if s_obj == "Entity Dashboard":
+        dashboard = red.get("dashboard")
+        if not isinstance(dashboard, dict):
+            return []
+        items = []
+        for cat, cat_items in dashboard.items():
+            if isinstance(cat_items, list):
+                for item in cat_items:
+                    if isinstance(item, dict):
+                        item_copy = dict(item)
+                        item_copy.setdefault("category", cat)
+                        items.append(item_copy)
+        return items
+    # General Summary / Overall Summary & Voice
+    return red.get("key_findings") or []
+
+
+async def _hierarchical_reduce(client, rs, ri, q, mapped, s_model, s_rpm, s_obj):
+    """Two-pass hierarchical reduce for large finding sets.
+
+    When the number of mapped findings exceeds REDUCE_BATCH_THRESHOLD the
+    reduce is performed in two phases:
+    1. Each batch of at most REDUCE_BATCH_THRESHOLD findings is reduced to an
+       intermediate result (de-duplicated, with pages consolidated).
+    2. All intermediate items are combined and reduced to the final result.
+
+    This prevents the LLM from receiving or producing oversized payloads that
+    would lead to truncated responses, missing page references, and low
+    citation-confidence scores.
+    """
+    if len(mapped) <= REDUCE_BATCH_THRESHOLD:
+        return await call_gemini_json_sum_async(
+            client, rs, f"{ri}\nQ:{q}\nD:{json.dumps(mapped)}", s_model, s_rpm
+        )
+
+    batches = [
+        mapped[i:i + REDUCE_BATCH_THRESHOLD]
+        for i in range(0, len(mapped), REDUCE_BATCH_THRESHOLD)
+    ]
+    intermediate_items: list = []
+
+    for batch_num, batch in enumerate(batches, start=1):
+        st.write(f"  Reducing batch {batch_num}/{len(batches)} ({len(batch)} items)...")
+        batch_red = await call_gemini_json_sum_async(
+            client, rs,
+            f"{ri}\nQ:{q}\nD:{json.dumps(batch)}",
+            s_model, s_rpm,
+        )
+        extracted = _extract_reduce_items(batch_red, s_obj)
+        if extracted:
+            intermediate_items.extend(extracted)
+        elif isinstance(batch_red, dict) and not batch_red.get("error"):
+            # Reduce returned a non-empty dict but items couldn't be extracted;
+            # fall back to raw batch findings so nothing is silently dropped.
+            intermediate_items.extend(batch)
+
+    if not intermediate_items:
+        # All batch reduces failed; use raw mapped items so the final reduce
+        # still has something to work with.
+        intermediate_items = list(mapped)
+
+    st.write(f"  Final merge reduce of {len(intermediate_items)} consolidated items...")
+    return await call_gemini_json_sum_async(
+        client, rs,
+        f"{ri}\nQ:{q}\nD:{json.dumps(intermediate_items)}",
+        s_model, s_rpm,
+    )
+
 
 def extract_pages_sum(path):
     """
@@ -1926,6 +2014,7 @@ else:
     f_sum = st.file_uploader("Upload PDFs for Analysis", type="pdf", accept_multiple_files=True)
     q_sum = st.text_area("Analysis Queries (one per line):", placeholder="e.g., What are the total financial liabilities?")
     
+    final_res = []  # initialise so display code below is safe even when button hasn't been clicked
     if st.button("🔍 Perform Deep Analysis", use_container_width=True):
         if not f_sum or not gem_key or not q_sum.strip(): st.error("Missing Files/Key/Query"); st.stop()
         
@@ -2019,7 +2108,7 @@ else:
                                     break
 
                     st.write(f"Reducing {len(mapped)} findings...")
-                    red = await call_gemini_json_sum_async(client, rs, f"{ri}\nQ:{q}\nD:{json.dumps(mapped)}", s_model, s_rpm)
+                    red = await _hierarchical_reduce(client, rs, ri, q, mapped, s_model, s_rpm, s_obj)
                     # Fallback: if the reduce step returned an empty/missing matrix, an error,
                     # or a non-dict response but the map step did find items, build the matrix
                     # directly from the mapped items.  This covers three failure modes:
