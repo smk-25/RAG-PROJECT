@@ -232,6 +232,12 @@ EMBEDDING_BATCH_SIZE = 64          # Encode in batches to limit peak memory
 MAX_CITATION_SENTENCES = 50        # Cap sentences fed into citation embedding pass
 MAX_CHUNKS_WARNING_THRESHOLD = 1500  # Warn user when chunk count is very high
 REDUCE_BATCH_THRESHOLD = 50        # Max findings before switching to hierarchical reduce
+# Common English stop-words excluded from evidence chunk-search scoring so that
+# low-value tokens (e.g. "the", "and") do not dominate the relevance score.
+_EVIDENCE_STOP_WORDS = frozenset({
+    "the", "a", "an", "of", "in", "to", "for", "and", "or", "is",
+    "are", "will", "shall", "be", "at", "by",
+})
 
 # --------------------------
 # Initialization
@@ -1113,17 +1119,15 @@ def _extract_reduce_items(red: dict, s_obj: str) -> list:
 
 
 async def _hierarchical_reduce(client, rs, ri, q, mapped, s_model, s_rpm, s_obj):
-    """Two-pass hierarchical reduce for large finding sets.
+    """Two-phase hierarchical reduce with **parallel** batch reduces.
 
-    When the number of mapped findings exceeds REDUCE_BATCH_THRESHOLD the
-    reduce is performed in two phases:
-    1. Each batch of at most REDUCE_BATCH_THRESHOLD findings is reduced to an
-       intermediate result (de-duplicated, with pages consolidated).
-    2. All intermediate items are combined and reduced to the final result.
+    Phase 1: All batches of at most REDUCE_BATCH_THRESHOLD findings are reduced
+             concurrently via asyncio.gather, eliminating the sequential wait
+             that caused long delays and heightened 429 exposure.
+    Phase 2: All intermediate items are merged in a single final reduce call.
 
-    This prevents the LLM from receiving or producing oversized payloads that
-    would lead to truncated responses, missing page references, and low
-    citation-confidence scores.
+    Falls back to raw mapped items when every batch reduce fails so the final
+    reduce still has material to work with.
     """
     try:
         if len(mapped) <= REDUCE_BATCH_THRESHOLD:
@@ -1135,38 +1139,182 @@ async def _hierarchical_reduce(client, rs, ri, q, mapped, s_model, s_rpm, s_obj)
             mapped[i:i + REDUCE_BATCH_THRESHOLD]
             for i in range(0, len(mapped), REDUCE_BATCH_THRESHOLD)
         ]
-        intermediate_items: list = []
+        st.write(f"  Parallel reducing {len(batches)} batch(es) ({len(mapped)} findings)...")
 
-        for batch_num, batch in enumerate(batches, start=1):
-            st.write(f"  Reducing batch {batch_num}/{len(batches)} ({len(batch)} items)...")
-            batch_red = await call_gemini_json_sum_async(
-                client, rs,
-                f"{ri}\nQ:{q}\nD:{json.dumps(batch)}",
-                s_model, s_rpm,
-            )
-            extracted = _extract_reduce_items(batch_red, s_obj)
+        # Run all batch reduces concurrently to minimize wall-clock latency.
+        batch_results = await asyncio.gather(
+            *[
+                call_gemini_json_sum_async(
+                    client, rs, f"{ri}\nQ:{q}\nD:{json.dumps(b)}", s_model, s_rpm
+                )
+                for b in batches
+            ],
+            return_exceptions=True,
+        )
+
+        intermediate_items: list = []
+        for batch, br in zip(batches, batch_results):
+            if isinstance(br, Exception):
+                continue  # skip failed batches; the final merge still proceeds
+            extracted = _extract_reduce_items(br, s_obj)
             if extracted:
                 intermediate_items.extend(extracted)
-            elif isinstance(batch_red, dict) and not batch_red.get("error"):
-                # Reduce returned a non-empty dict but items couldn't be extracted;
-                # fall back to raw batch findings so nothing is silently dropped.
+            elif isinstance(br, dict) and not br.get("error"):
+                # Reduce returned a valid dict but no extractable items;
+                # preserve raw batch findings so nothing is silently dropped.
                 intermediate_items.extend(batch)
 
         if not intermediate_items:
-            # All batch reduces failed; use raw mapped items so the final reduce
-            # still has something to work with.
             intermediate_items = list(mapped)
 
-        st.write(f"  Final merge reduce of {len(intermediate_items)} consolidated items...")
+        st.write(f"  Final merge of {len(intermediate_items)} consolidated items...")
         return await call_gemini_json_sum_async(
             client, rs,
             f"{ri}\nQ:{q}\nD:{json.dumps(intermediate_items)}",
             s_model, s_rpm,
         )
     except Exception as exc:
-        # Return an error dict rather than propagating; the caller's fallback
-        # logic will rebuild the result from the raw mapped items.
         return {"error": f"Reduce phase error: {exc}"}
+
+
+def _apply_result_fallback(mapped: list, red, s_obj: str) -> dict:
+    """Unified fallback: rebuild reduce result from raw mapped items when the
+    reduce phase returned an error, an empty result, or a non-dict.
+
+    Covers all four structured objectives (Compliance Matrix, Risk Assessment,
+    Entity Dashboard, Ambiguity Scrutiny) and the summary objectives.
+    Returns a guaranteed dict.
+    """
+    if not isinstance(red, dict):
+        red = {}
+    if not mapped:
+        return red
+    red.pop("error", None)
+
+    # Normalize page (singular) → pages (list) on every mapped item once.
+    for item in mapped:
+        if isinstance(item, dict) and "page" in item and "pages" not in item:
+            item["pages"] = [item["page"]]
+
+    valid = [m for m in mapped if isinstance(m, dict) and not m.get("error")]
+
+    if s_obj == "Compliance Matrix" and not red.get("matrix"):
+        red["matrix"] = [n for n in (_normalize_compliance_item(m) for m in mapped) if n is not None]
+    elif s_obj == "Risk Assessment" and not red.get("risks"):
+        red["risks"] = valid
+    elif s_obj == "Ambiguity Scrutiny" and not red.get("ambiguities"):
+        red["ambiguities"] = valid
+    elif s_obj == "Entity Dashboard" and (
+        not red.get("dashboard")
+        or not any(isinstance(v, list) and v for v in red.get("dashboard", {}).values())
+    ):
+        rebuilt: dict = {}
+        for m in valid:
+            cat = m.get("category", "General")
+            rebuilt.setdefault(cat, []).append({
+                "entity": m.get("entity", ""),
+                "context": m.get("context", ""),
+                "evidence": m.get("evidence", ""),
+                "pages": m["pages"] if isinstance(m.get("pages"), list) else ([m.get("page")] if m.get("page") else []),
+            })
+        if rebuilt:
+            red["dashboard"] = rebuilt
+    return red
+
+
+def _recover_evidence_in_result(mapped: list, red: dict, s_obj: str, chunks: list) -> None:
+    """In-place evidence recovery for structured reduce results.
+
+    Fills empty 'evidence' fields in the reduce output by searching:
+    1. Exact / substring match against the mapped-item evidence index.
+    2. Word-overlap fuzzy match (≥ 2 shared words).
+    3. Best-matching raw chunk sentence as a last resort.
+
+    Operates on all four structured objectives; no-ops for summary objectives.
+    """
+    if not isinstance(red, dict):
+        return
+
+    # Build a flat evidence index from all mapped items.
+    ev_index: dict[str, str] = {}
+    for m in mapped:
+        if isinstance(m, dict) and m.get("evidence"):
+            for field in ("item", "clause", "entity", "ambiguous_text"):
+                val = m.get(field)
+                if val:
+                    ev_index[str(val).lower().strip()] = m["evidence"]
+
+    stop_words = _EVIDENCE_STOP_WORDS
+
+    def _find_evidence(primary: str, secondary: str = "") -> str:
+        key = primary.lower().strip()
+        if not key:
+            return ""
+        # Strategy 1: substring / exact match.
+        for k, v in ev_index.items():
+            if key in k or k in key:
+                return v
+        # Strategy 2: word-overlap fuzzy match.
+        key_words = set(key.split())
+        best_ev, best_overlap = "", 0
+        for k, v in ev_index.items():
+            overlap = len(key_words & set(k.split()))
+            if overlap > best_overlap:
+                best_overlap, best_ev = overlap, v
+        if best_ev and best_overlap >= 2:
+            return best_ev
+        # Strategy 3: search raw chunks for the best-matching sentence.
+        if chunks:
+            search_words = {
+                w for w in (set((primary + " " + secondary).lower().split()) - stop_words)
+                if len(w) > 3
+            }
+            best_chunk, best_score = None, 0
+            for chunk in chunks:
+                cl = chunk["text"].lower()
+                score = sum(1 for w in search_words if w in cl)
+                if score > best_score:
+                    best_score, best_chunk = score, chunk
+            min_score = 1 if len(search_words) <= 2 else 2
+            if best_chunk and best_score >= min_score:
+                try:
+                    sents = simple_sent_tokenize_shared(best_chunk["text"])
+                    best_sent = max(
+                        sents,
+                        key=lambda s: sum(1 for w in search_words if w in s.lower()),
+                        default="",
+                    )
+                    return best_sent.strip()
+                except Exception:
+                    pass
+        return ""
+
+    if s_obj == "Compliance Matrix":
+        for entry in red.get("matrix") or []:
+            if isinstance(entry, dict) and not entry.get("evidence"):
+                entry["evidence"] = _find_evidence(
+                    str(entry.get("item") or ""), str(entry.get("detail") or "")
+                )
+    elif s_obj == "Risk Assessment":
+        for entry in red.get("risks") or []:
+            if isinstance(entry, dict) and not entry.get("evidence"):
+                entry["evidence"] = _find_evidence(
+                    str(entry.get("clause") or ""), str(entry.get("reason") or "")
+                )
+    elif s_obj == "Entity Dashboard":
+        for items in (red.get("dashboard") or {}).values():
+            if isinstance(items, list):
+                for entry in items:
+                    if isinstance(entry, dict) and not entry.get("evidence"):
+                        entry["evidence"] = _find_evidence(
+                            str(entry.get("entity") or ""), str(entry.get("context") or "")
+                        )
+    elif s_obj == "Ambiguity Scrutiny":
+        for entry in red.get("ambiguities") or []:
+            if isinstance(entry, dict) and not entry.get("evidence"):
+                entry["evidence"] = _find_evidence(
+                    str(entry.get("ambiguous_text") or ""), str(entry.get("issue") or "")
+                )
 
 
 def extract_pages_sum(path):
@@ -2043,439 +2191,110 @@ else:
                 ms, mi, rs, ri = get_sum_prompts(s_obj)
                 res = []
                 batches = [chunks[i:i+s_batch] for i in range(0, len(chunks), s_batch)]
+                # Pre-build all chunk payloads once (reused for retries / recovery).
+                chunk_payloads = [
+                    "\n\n".join(
+                        f"---\nID:{c['id']} P:{_chunk_page_label(c)}\nText: {c['text']}"
+                        for c in b
+                    )
+                    for b in batches
+                ]
                 for q in q_sum.splitlines():
-                    if not q.strip(): continue
+                    if not q.strip():
+                        continue
                     t0 = time.time()
                     st.write(f"Mapping query: {q}...")
-                    m_tasks = []
-                    for b in batches:
-                        # Show full page range (P:start-end) so the LLM can correctly
-                        # attribute evidence that falls on any page within a multi-page chunk.
-                        chunk_payload = "\n\n".join([
-                            f"---\nID:{c['id']} P:{_chunk_page_label(c)}\nText: {c['text']}"
-                            for c in b
-                        ])
-                        m_tasks.append(call_gemini_json_sum_async(client, ms, f"{mi}\nQ:{q}\nContext Data:\n{chunk_payload}", s_model, s_rpm))
-                    # return_exceptions=True prevents one failing batch from cancelling
-                    # all other concurrent tasks (mirrors Summarizationcode.py reduce phase).
-                    mapped_batches = await asyncio.gather(*m_tasks, return_exceptions=True); t_m = time.time()
-                    mapped = []
-                    failed_batch_indices = []
+
+                    # ----------------------------------------------------------
+                    # PARALLEL MAP PHASE
+                    # All chunk batches are sent to the LLM concurrently.
+                    # return_exceptions=True is critical: it prevents a single
+                    # 429 (rate-limit) or API error from cancelling all other
+                    # concurrent tasks, so the map phase always collects as many
+                    # findings as possible even when some batches fail.
+                    # ----------------------------------------------------------
+                    mapped_batches = await asyncio.gather(
+                        *[
+                            call_gemini_json_sum_async(
+                                client, ms, f"{mi}\nQ:{q}\nContext Data:\n{p}", s_model, s_rpm
+                            )
+                            for p in chunk_payloads
+                        ],
+                        return_exceptions=True,
+                    )
+                    t_m = time.time()
+
+                    mapped: list = []
+                    failed_indices: list = []
                     for bi, b in enumerate(mapped_batches):
                         if isinstance(b, Exception):
-                            failed_batch_indices.append(bi)
-                            continue  # skip failed batches, keep results from the rest
-                        mapped.extend(_unwrap_batch_result(b, s_obj))
-                    # Free task list and raw results now that findings are extracted.
-                    del m_tasks, mapped_batches
+                            failed_indices.append(bi)
+                        else:
+                            mapped.extend(_unwrap_batch_result(b, s_obj))
+                    del mapped_batches
 
-                    # For Compliance Matrix: retry ALL failed batches sequentially so
-                    # that evidence from every page of the document is captured.
-                    # Partial batch failures (e.g. a single 429) would otherwise leave
-                    # entire page ranges unanalysed, causing the matrix to cover only a
-                    # fraction of the document.
-                    if s_obj == "Compliance Matrix" and failed_batch_indices:
-                        st.write(f"Retrying {len(failed_batch_indices)} failed batch(es) for complete compliance coverage...")
-                        for fi in failed_batch_indices:
-                            retry_payload = "\n\n".join(
-                                f"---\nID:{c['id']} P:{_chunk_page_label(c)}\nText: {c['text']}"
-                                for c in batches[fi]
-                            )
-                            retry_result = await call_gemini_json_sum_async(
+                    # Retry failed batches sequentially — important for Compliance
+                    # Matrix where every page range must be covered.
+                    if failed_indices:
+                        st.write(f"Retrying {len(failed_indices)} failed batch(es)...")
+                        for fi in failed_indices:
+                            retry = await call_gemini_json_sum_async(
                                 client, ms,
-                                f"{mi}\nQ:{q}\nContext Data:\n{retry_payload}",
-                                s_model, s_rpm
+                                f"{mi}\nQ:{q}\nContext Data:\n{chunk_payloads[fi]}",
+                                s_model, s_rpm,
                             )
-                            recovered = _unwrap_batch_result(retry_result, s_obj)
-                            if recovered:
-                                mapped.extend(recovered)
+                            mapped.extend(_unwrap_batch_result(retry, s_obj))
 
-                    # Recovery: if all map batches returned no items (e.g. all failed or LLM
-                    # returned empty arrays), attempt direct extraction on each remaining batch
-                    # of chunks sequentially.  For modes that require comprehensive coverage
-                    # (e.g. Compliance Matrix) we scan ALL batches to collect all findings;
-                    # for other modes we stop as soon as we get any findings.
+                    # Emergency recovery: if all map batches returned nothing,
+                    # attempt sequential extraction one batch at a time.
                     if not mapped and chunks:
-                        st.write("Map phase yielded no findings -- attempting recovery extraction...")
-                        for batch_start in range(0, len(chunks), s_batch):
-                            recovery_payload = "\n\n".join(
-                                f"---\nID:{c['id']} P:{_chunk_page_label(c)}\nText: {c['text']}"
-                                for c in chunks[batch_start:batch_start + s_batch]
+                        st.write("Recovery extraction in progress...")
+                        for p in chunk_payloads:
+                            items = _unwrap_batch_result(
+                                await call_gemini_json_sum_async(
+                                    client, ms, f"{mi}\nQ:{q}\nContext Data:\n{p}", s_model, s_rpm
+                                ),
+                                s_obj,
                             )
-                            recovery_result = await call_gemini_json_sum_async(
-                                client, ms,
-                                f"{mi}\nQ:{q}\nContext Data:\n{recovery_payload}",
-                                s_model, s_rpm
-                            )
-                            recovered = _unwrap_batch_result(recovery_result, s_obj)
-                            if recovered:
-                                mapped.extend(recovered)
-                                # For Compliance Matrix we must scan all batches to collect
-                                # every requirement across the full document.  For other
-                                # modes we stop after the first successful batch.
+                            if items:
+                                mapped.extend(items)
                                 if s_obj != "Compliance Matrix":
-                                    break
+                                    break  # one successful batch is enough for most modes
 
+                    # ----------------------------------------------------------
+                    # HIERARCHICAL REDUCE PHASE (parallel batch reduces)
+                    # ----------------------------------------------------------
                     st.write(f"Reducing {len(mapped)} findings...")
                     red = await _hierarchical_reduce(client, rs, ri, q, mapped, s_model, s_rpm, s_obj)
-                    # Fallback: if the reduce step returned an empty/missing matrix, an error,
-                    # or a non-dict response but the map step did find items, build the matrix
-                    # directly from the mapped items.  This covers three failure modes:
-                    #  1. Reduce returned an API/parse error dict.
-                    #  2. Reduce returned a valid dict but with an empty or absent 'matrix' key.
-                    #  3. Reduce returned something that is not a dict at all.
-                    if s_obj == "Compliance Matrix" and mapped and (
-                        not isinstance(red, dict) or not red.get("matrix")
-                    ):
-                        if not isinstance(red, dict):
-                            red = {}
-                        red.pop("error", None)
-                        red["matrix"] = [
-                            n for n in (_normalize_compliance_item(m) for m in mapped) if n is not None
-                        ]
-                    # Fallback: if the reduce step returned an empty/missing risks list, an error,
-                    # or a non-dict response but the map step did find items, build the risks list
-                    # directly from the mapped items.
-                    if s_obj == "Risk Assessment" and mapped and (
-                        not isinstance(red, dict) or not red.get("risks")
-                    ):
-                        if not isinstance(red, dict):
-                            red = {}
-                        red.pop("error", None)
-                        fallback_risks = [m for m in mapped if isinstance(m, dict) and not m.get("error")]
-                        # Normalise page (singular) → pages (array) for display consistency
-                        for item in fallback_risks:
-                            if "page" in item and "pages" not in item:
-                                item["pages"] = [item["page"]]
-                        red["risks"] = fallback_risks
-                    # Fallback: if the reduce step returned an empty/missing ambiguities list, an error,
-                    # or a non-dict response but the map step did find items, build the ambiguities list
-                    # directly from the mapped items.
-                    if s_obj == "Ambiguity Scrutiny" and mapped and (
-                        not isinstance(red, dict) or not red.get("ambiguities")
-                    ):
-                        if not isinstance(red, dict):
-                            red = {}
-                        red.pop("error", None)
-                        fallback_ambiguities = [m for m in mapped if isinstance(m, dict) and not m.get("error")]
-                        # Normalize page (singular) → pages (array) for display consistency
-                        for item in fallback_ambiguities:
-                            if "page" in item and "pages" not in item:
-                                item["pages"] = [item["page"]]
-                        red["ambiguities"] = fallback_ambiguities
-                    # Fallback: if the reduce step returned an empty/missing dashboard, an error,
-                    # or a non-dict response but the map step did find entities, build the dashboard
-                    # directly from the mapped flat list grouped by category.
-                    # Also triggers when the dashboard exists but every category list is empty
-                    # (e.g. the LLM excluded all entities because evidence was missing).
-                    if s_obj == "Entity Dashboard" and mapped and (
-                        not isinstance(red, dict)
-                        or not red.get("dashboard")
-                        or not any(isinstance(v, list) and v for v in red.get("dashboard", {}).values())
-                    ):
-                        if not isinstance(red, dict):
-                            red = {}
-                        red.pop("error", None)
-                        rebuilt_dashboard: dict = {}
-                        for m in mapped:
-                            if isinstance(m, dict) and not m.get("error"):
-                                cat = m.get("category", "General")
-                                if cat not in rebuilt_dashboard:
-                                    rebuilt_dashboard[cat] = []
-                                pg = m.get("page")
-                                rebuilt_dashboard[cat].append({
-                                    "entity": m.get("entity", ""),
-                                    "context": m.get("context", ""),
-                                    "evidence": m.get("evidence", ""),
-                                    "pages": (
-                                        m["pages"] if isinstance(m.get("pages"), list)
-                                        else ([pg] if pg else [])
-                                    ),
-                                })
-                        if rebuilt_dashboard:
-                            red["dashboard"] = rebuilt_dashboard
-                    # Normalize reduce-step matrix items to canonical key names so
-                    # downstream display code always sees 'item', 'detail', 'mandatory', etc.
+
+                    # Unified fallback: rebuild from mapped items if reduce failed.
+                    red = _apply_result_fallback(mapped, red, s_obj)
+
+                    # Normalize Compliance Matrix item keys to canonical names.
                     if s_obj == "Compliance Matrix" and isinstance(red, dict) and red.get("matrix"):
                         red["matrix"] = [
-                            n for n in (_normalize_compliance_item(e) for e in red["matrix"]) if n is not None
+                            n for n in (_normalize_compliance_item(e) for e in red["matrix"])
+                            if n is not None
                         ]
-                    # Post-process: recover missing evidence in Compliance Matrix from mapped items
-                    if s_obj == "Compliance Matrix" and isinstance(red, dict) and "matrix" in red:
-                        mapped_evidence_by_item = {}
-                        mapped_evidence_by_detail = {}
-                        mapped_fallback_by_item = {}  # fallback: use detail when evidence is missing
-                        for m in mapped:
-                            if isinstance(m, dict):
-                                ev = m.get("evidence") or ""
-                                if ev:
-                                    if m.get("item"):
-                                        mapped_evidence_by_item[str(m["item"]).lower().strip()] = ev
-                                    if m.get("detail"):
-                                        dk = str(m["detail"]).lower().strip()[:80]
-                                        if dk:
-                                            mapped_evidence_by_detail[dk] = ev
-                                elif m.get("detail") and m.get("item"):
-                                    # fallback: store detail text for last-resort recovery
-                                    mapped_fallback_by_item[str(m["item"]).lower().strip()] = str(m["detail"])
-                        for entry in red.get("matrix", []):
-                            if isinstance(entry, dict) and not entry.get("evidence"):
-                                item_key = str(entry.get("item") or "").lower().strip()
-                                # Strategy 1: substring match on item name
-                                for mk, mv in mapped_evidence_by_item.items():
-                                    if item_key and (item_key in mk or mk in item_key):
-                                        entry["evidence"] = mv
-                                        break
-                                # Strategy 2: match on detail field
-                                if not entry.get("evidence"):
-                                    detail_key = str(entry.get("detail") or "").lower().strip()[:80]
-                                    for dk, dv in mapped_evidence_by_detail.items():
-                                        if detail_key and len(detail_key) > 10 and (detail_key in dk or dk in detail_key):
-                                            entry["evidence"] = dv
-                                            break
-                                # Strategy 3: word-overlap fuzzy match on item name
-                                if not entry.get("evidence"):
-                                    item_words = set(item_key.split()) if item_key else set()
-                                    best_ev, best_overlap = None, 0
-                                    for mk, mv in mapped_evidence_by_item.items():
-                                        overlap = len(item_words & set(mk.split()))
-                                        if overlap > best_overlap:
-                                            best_overlap = overlap
-                                            best_ev = mv
-                                    if best_ev and best_overlap >= 2:
-                                        entry["evidence"] = best_ev
-                                # Strategy 4: fallback to mapped item's detail text
-                                if not entry.get("evidence"):
-                                    for fk, fv in mapped_fallback_by_item.items():
-                                        if item_key and (item_key in fk or fk in item_key):
-                                            entry["evidence"] = fv
-                                            break
-                                    if not entry.get("evidence"):
-                                        item_words = set(item_key.split()) if item_key else set()
-                                        for fk, fv in mapped_fallback_by_item.items():
-                                            if len(item_words & set(fk.split())) >= 2:
-                                                entry["evidence"] = fv
-                                                break
-                                # Strategy 5: search original chunk texts as last resort
-                                if not entry.get("evidence") and chunks:
-                                    stop_words = {"the", "a", "an", "of", "in", "to", "for", "and", "or", "is", "are", "will", "shall", "be", "at", "by"}
-                                    search_words = (set(item_key.split()) | set(str(entry.get("detail") or "").lower().split())) - stop_words
-                                    search_words = {w for w in search_words if len(w) > 3}
-                                    best_chunk, best_score = None, 0
-                                    for chunk in chunks:
-                                        chunk_lower = chunk["text"].lower()
-                                        score = sum(1 for w in search_words if w in chunk_lower)
-                                        if score > best_score:
-                                            best_score = score
-                                            best_chunk = chunk
-                                    min_score = 1 if len(search_words) <= 2 else 2
-                                    if best_chunk and best_score >= min_score:
-                                        try:
-                                            sents = simple_sent_tokenize_shared(best_chunk["text"])
-                                            best_sent = max(sents, key=lambda s: sum(1 for w in search_words if w in s.lower()), default="")
-                                            if best_sent and best_sent.strip():
-                                                entry["evidence"] = best_sent.strip()
-                                        except Exception:
-                                            pass
-                    # Post-process: recover missing evidence in Entity Dashboard from mapped items
-                    elif s_obj == "Entity Dashboard" and isinstance(red, dict) and "dashboard" in red:
-                        mapped_evidence_by_entity = {}
-                        mapped_evidence_by_context = {}
-                        for m in mapped:
-                            if isinstance(m, dict) and m.get("evidence"):
-                                if m.get("entity"):
-                                    mapped_evidence_by_entity[m["entity"].lower().strip()] = m["evidence"]
-                                if m.get("context"):
-                                    ck = m["context"].lower().strip()[:80]
-                                    if ck:
-                                        mapped_evidence_by_context[ck] = m["evidence"]
-                        for _, items in red.get("dashboard", {}).items():
-                            if not isinstance(items, list):
-                                continue
-                            for entry in items:
-                                if isinstance(entry, dict) and not entry.get("evidence"):
-                                    ent_key = entry.get("entity", "").lower().strip()
-                                    # Strategy 1: substring match on entity name
-                                    for ek, ev in mapped_evidence_by_entity.items():
-                                        if ent_key and (ent_key in ek or ek in ent_key):
-                                            entry["evidence"] = ev
-                                            break
-                                    # Strategy 2: match on context field
-                                    if not entry.get("evidence"):
-                                        ctx_key = entry.get("context", "").lower().strip()[:80]
-                                        for ck, cv in mapped_evidence_by_context.items():
-                                            if ctx_key and len(ctx_key) > 10 and (ctx_key in ck or ck in ctx_key):
-                                                entry["evidence"] = cv
-                                                break
-                                    # Strategy 3: word-overlap fuzzy match on entity name
-                                    if not entry.get("evidence"):
-                                        ent_words = set(ent_key.split()) if ent_key else set()
-                                        best_ev, best_overlap = None, 0
-                                        for ek, ev in mapped_evidence_by_entity.items():
-                                            overlap = len(ent_words & set(ek.split()))
-                                            if overlap > best_overlap:
-                                                best_overlap = overlap
-                                                best_ev = ev
-                                        if best_ev and best_overlap >= 2:
-                                            entry["evidence"] = best_ev
-                                    # Strategy 4: search original chunk texts as last resort
-                                    if not entry.get("evidence") and chunks:
-                                        stop_words = {"the", "a", "an", "of", "in", "to", "for", "and", "or", "is", "are"}
-                                        search_words = {w for w in ent_key.split() if len(w) > 3 and w not in stop_words}
-                                        best_chunk, best_score = None, 0
-                                        for chunk in chunks:
-                                            chunk_lower = chunk["text"].lower()
-                                            score = sum(1 for w in search_words if w in chunk_lower)
-                                            if score > best_score:
-                                                best_score = score
-                                                best_chunk = chunk
-                                        if best_chunk and best_score >= 1:
-                                            try:
-                                                sents = simple_sent_tokenize_shared(best_chunk["text"])
-                                                best_sent = max(sents, key=lambda s: sum(1 for w in search_words if w in s.lower()), default="")
-                                                if best_sent and best_sent.strip():
-                                                    entry["evidence"] = best_sent.strip()
-                                            except Exception:
-                                                pass
-                    # Post-process: recover missing evidence in Risk Assessment from mapped items
-                    elif s_obj == "Risk Assessment" and isinstance(red, dict) and "risks" in red:
-                        mapped_evidence_by_clause = {}
-                        mapped_evidence_by_reason = {}
-                        for m in mapped:
-                            if isinstance(m, dict) and m.get("evidence"):
-                                if m.get("clause"):
-                                    mapped_evidence_by_clause[m["clause"].lower().strip()] = m["evidence"]
-                                if m.get("reason"):
-                                    rk = m["reason"].lower().strip()[:80]
-                                    if rk:
-                                        mapped_evidence_by_reason[rk] = m["evidence"]
-                        for entry in red.get("risks", []):
-                            if isinstance(entry, dict) and not entry.get("evidence"):
-                                clause_key = entry.get("clause", "").lower().strip()
-                                # Strategy 1: substring match on clause
-                                for ck, cv in mapped_evidence_by_clause.items():
-                                    if clause_key and (clause_key in ck or ck in clause_key):
-                                        entry["evidence"] = cv
-                                        break
-                                # Strategy 2: match on reason field
-                                if not entry.get("evidence"):
-                                    reason_key = entry.get("reason", "").lower().strip()[:80]
-                                    for rk, rv in mapped_evidence_by_reason.items():
-                                        if reason_key and len(reason_key) > 10 and (reason_key in rk or rk in reason_key):
-                                            entry["evidence"] = rv
-                                            break
-                                # Strategy 3: word-overlap fuzzy match on clause
-                                if not entry.get("evidence"):
-                                    clause_words = set(clause_key.split()) if clause_key else set()
-                                    best_ev, best_overlap = None, 0
-                                    for ck, cv in mapped_evidence_by_clause.items():
-                                        overlap = len(clause_words & set(ck.split()))
-                                        if overlap > best_overlap:
-                                            best_overlap = overlap
-                                            best_ev = cv
-                                    if best_ev and best_overlap >= 2:
-                                        entry["evidence"] = best_ev
-                                # Strategy 4: search original chunk texts as last resort
-                                if not entry.get("evidence") and chunks:
-                                    stop_words = {"the", "a", "an", "of", "in", "to", "for", "and", "or", "is", "are", "will", "shall", "be"}
-                                    search_words = (set(clause_key.split()) | set(entry.get("reason", "").lower().split())) - stop_words
-                                    search_words = {w for w in search_words if len(w) > 3}
-                                    best_chunk, best_score = None, 0
-                                    for chunk in chunks:
-                                        chunk_lower = chunk["text"].lower()
-                                        score = sum(1 for w in search_words if w in chunk_lower)
-                                        if score > best_score:
-                                            best_score = score
-                                            best_chunk = chunk
-                                    min_score = 1 if len(search_words) <= 2 else 2
-                                    if best_chunk and best_score >= min_score:
-                                        try:
-                                            sents = simple_sent_tokenize_shared(best_chunk["text"])
-                                            best_sent = max(sents, key=lambda s: sum(1 for w in search_words if w in s.lower()), default="")
-                                            if best_sent and best_sent.strip():
-                                                entry["evidence"] = best_sent.strip()
-                                        except Exception:
-                                            pass
-                    # Post-process: recover missing evidence in Ambiguity Scrutiny from mapped items
-                    elif s_obj == "Ambiguity Scrutiny" and isinstance(red, dict) and "ambiguities" in red:
-                        mapped_evidence_by_text = {}
-                        mapped_evidence_by_issue = {}
-                        for m in mapped:
-                            if isinstance(m, dict) and m.get("evidence"):
-                                if m.get("ambiguous_text"):
-                                    mapped_evidence_by_text[m["ambiguous_text"].lower().strip()] = m["evidence"]
-                                if m.get("issue"):
-                                    ik = m["issue"].lower().strip()[:80]
-                                    if ik:
-                                        mapped_evidence_by_issue[ik] = m["evidence"]
-                        for entry in red.get("ambiguities", []):
-                            if isinstance(entry, dict) and not entry.get("evidence"):
-                                text_key = entry.get("ambiguous_text", "").lower().strip()
-                                # Strategy 1: substring match on ambiguous_text
-                                for tk, tv in mapped_evidence_by_text.items():
-                                    if text_key and (text_key in tk or tk in text_key):
-                                        entry["evidence"] = tv
-                                        break
-                                # Strategy 2: match on issue field
-                                if not entry.get("evidence"):
-                                    issue_key = entry.get("issue", "").lower().strip()[:80]
-                                    for ik, iv in mapped_evidence_by_issue.items():
-                                        if issue_key and len(issue_key) > 10 and (issue_key in ik or ik in issue_key):
-                                            entry["evidence"] = iv
-                                            break
-                                # Strategy 3: word-overlap fuzzy match on ambiguous_text
-                                if not entry.get("evidence"):
-                                    text_words = set(text_key.split()) if text_key else set()
-                                    best_ev, best_overlap = None, 0
-                                    for tk, tv in mapped_evidence_by_text.items():
-                                        overlap = len(text_words & set(tk.split()))
-                                        if overlap > best_overlap:
-                                            best_overlap = overlap
-                                            best_ev = tv
-                                    if best_ev and best_overlap >= 2:
-                                        entry["evidence"] = best_ev
-                                # Strategy 4: search original chunk texts as last resort
-                                if not entry.get("evidence") and chunks:
-                                    stop_words = {"the", "a", "an", "of", "in", "to", "for", "and", "or", "is", "are"}
-                                    search_words = (set(text_key.split()) | set(entry.get("issue", "").lower().split())) - stop_words
-                                    search_words = {w for w in search_words if len(w) > 3}
-                                    best_chunk, best_score = None, 0
-                                    for chunk in chunks:
-                                        chunk_lower = chunk["text"].lower()
-                                        score = sum(1 for w in search_words if w in chunk_lower)
-                                        if score > best_score:
-                                            best_score = score
-                                            best_chunk = chunk
-                                    min_score = 1 if len(search_words) <= 2 else 2
-                                    if best_chunk and best_score >= min_score:
-                                        try:
-                                            sents = simple_sent_tokenize_shared(best_chunk["text"])
-                                            best_sent = max(sents, key=lambda s: sum(1 for w in search_words if w in s.lower()), default="")
-                                            if best_sent and best_sent.strip():
-                                                entry["evidence"] = best_sent.strip()
-                                        except Exception:
-                                            pass
-                    # Safety guard: ensure red is always a dict so the display
-                    # code (which calls red.get(...)) never raises AttributeError.
-                    # This can happen when the LLM returns a bare JSON array
-                    # and mapped is empty (so the mode-specific fallbacks above
-                    # did not trigger).
+
+                    # Unified evidence recovery from mapped items and raw chunks.
+                    _recover_evidence_in_result(mapped, red, s_obj, chunks)
+
+                    # Safety guard: ensure red is always a dict.
                     if not isinstance(red, dict):
-                        if isinstance(red, list) and s_obj == "Compliance Matrix":
-                            # Attempt to salvage a bare-list reduce result as a matrix.
-                            valid = [
-                                n for n in (
-                                    _normalize_compliance_item(item)
-                                    for item in red
-                                    if isinstance(item, dict)
-                                ) if n is not None
-                            ]
-                            red = {"matrix": valid}
-                        else:
-                            red = {}
-                    res.append({"query":q, "result":red, "map_t":t_m-t0, "red_t":time.time()-t_m, "mapped":mapped, "total_t":time.time()-t0, "chunk_count": len(chunks)})
+                        red = (
+                            {"matrix": [n for n in (_normalize_compliance_item(i) for i in red if isinstance(i, dict)) if n is not None]}
+                            if isinstance(red, list) and s_obj == "Compliance Matrix"
+                            else {}
+                        )
+
+                    res.append({
+                        "query": q, "result": red,
+                        "map_t": t_m - t0, "red_t": time.time() - t_m,
+                        "mapped": mapped, "total_t": time.time() - t0,
+                        "chunk_count": len(chunks),
+                    })
                 return res
-            
             # Use a fresh event loop for every analysis run to avoid stale asyncio
             # state between successive objective completions without a page reload.
             # asyncio.run() is NOT used here because in some Streamlit/Python
