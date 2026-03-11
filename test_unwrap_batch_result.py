@@ -1,9 +1,10 @@
-"""Unit tests for _unwrap_batch_result and related compliance-matrix helpers.
+"""Unit tests for _unwrap_batch_result, _linearize_table, and related helpers.
 
 These tests are intentionally self-contained: they copy the minimal logic
 from CombinedTenderAnalysis_V3.py so that the heavy Streamlit/ML dependencies
 are not required when the CI runs pytest.
 """
+import pandas as pd
 
 # ---------------------------------------------------------------------------
 # Inline copy of the functions under test (kept in sync with source)
@@ -387,4 +388,107 @@ class TestEvidenceRecoveryCoercion:
         entry = {"item": "Spec", "detail": 3.14, "evidence": ""}
         detail_key = str(entry.get("detail") or "").lower().strip()[:80]
         assert detail_key == "3.14"
+
+
+# ---------------------------------------------------------------------------
+# Inline copy of _linearize_table (kept in sync with CombinedTenderAnalysis_V3.py)
+# ---------------------------------------------------------------------------
+
+MAX_LINEARIZED_ROWS = 10
+
+
+def _linearize_table(df):
+    """Inline copy kept in sync with CombinedTenderAnalysis_V3.py."""
+    if df.empty:
+        return ""
+    headers = [str(c) for c in df.columns if str(c).strip() not in ("", "None")]
+    rows = []
+    for _, row in df.iterrows():
+        kv_pairs = []
+        for h, v in zip(df.columns, row):
+            h_str = str(h).strip()
+            v_str = str(v).strip() if pd.notna(v) else ""
+            if h_str and h_str not in ("None",) and v_str:
+                kv_pairs.append(f"{h_str}: {v_str}")
+        if kv_pairs:
+            rows.append(", ".join(kv_pairs))
+    col_str = ", ".join(headers) if headers else "unknown columns"
+    row_str = "; ".join(rows[:MAX_LINEARIZED_ROWS])
+    suffix = f" (and {len(rows) - MAX_LINEARIZED_ROWS} more rows)" if len(rows) > MAX_LINEARIZED_ROWS else ""
+    return f"Table with columns: {col_str}. Rows: {row_str}{suffix}."
+
+
+# ---------------------------------------------------------------------------
+# Tests for _linearize_table
+# ---------------------------------------------------------------------------
+
+class TestLinearizeTable:
+    """Validate that _linearize_table emits key-value row format."""
+
+    def test_empty_dataframe_returns_empty_string(self):
+        df = pd.DataFrame()
+        assert _linearize_table(df) == ""
+
+    def test_single_row_key_value_format(self):
+        df = pd.DataFrame([{"Item": "Mobilization", "Cost": "$10,000"}])
+        result = _linearize_table(df)
+        assert "Item: Mobilization" in result
+        assert "Cost: $10,000" in result
+
+    def test_multiple_rows_separated_by_semicolon(self):
+        df = pd.DataFrame([
+            {"Item": "Mobilization", "Cost": "$10,000"},
+            {"Item": "Equipment", "Cost": "$50,000"},
+        ])
+        result = _linearize_table(df)
+        assert "Item: Mobilization, Cost: $10,000" in result
+        assert "Item: Equipment, Cost: $50,000" in result
+        # Rows must be semicolon-separated
+        assert ";" in result
+
+    def test_column_headers_listed(self):
+        df = pd.DataFrame([{"Payment Term": "Advance", "Percentage": "30%"}])
+        result = _linearize_table(df)
+        assert result.startswith("Table with columns: Payment Term, Percentage")
+
+    def test_no_pipe_separator_in_row_values(self):
+        """Old format used ' | ' between values — new format must not."""
+        df = pd.DataFrame([{"A": "x", "B": "y"}])
+        result = _linearize_table(df)
+        # The key-value pairs should not use ' | ' between column values
+        assert " | " not in result
+
+    def test_nan_values_skipped(self):
+        df = pd.DataFrame([{"A": "hello", "B": float("nan"), "C": "world"}])
+        result = _linearize_table(df)
+        assert "A: hello" in result
+        assert "C: world" in result
+        # NaN column should not appear in the row
+        assert "nan" not in result.lower()
+
+    def test_more_than_max_rows_shows_suffix(self):
+        data = [{"Col": str(i)} for i in range(MAX_LINEARIZED_ROWS + 3)]
+        df = pd.DataFrame(data)
+        result = _linearize_table(df)
+        assert "more rows" in result
+
+    def test_exactly_max_rows_no_suffix(self):
+        data = [{"Col": str(i)} for i in range(MAX_LINEARIZED_ROWS)]
+        df = pd.DataFrame(data)
+        result = _linearize_table(df)
+        assert "more rows" not in result
+
+    def test_key_value_format_improves_query_match(self):
+        """Key-value format should contain both header name and value together.
+
+        This is the core regression test: if a user queries 'What is the
+        mobilization cost?' the linearisation must mention 'Cost' and the
+        dollar amount in proximity so embeddings match.
+        """
+        df = pd.DataFrame([{"Milestone": "Mobilization", "Amount": "$10,000", "Due": "Jan 2025"}])
+        result = _linearize_table(df)
+        # Each key-value pair must be "Header: Value"
+        assert "Milestone: Mobilization" in result
+        assert "Amount: $10,000" in result
+        assert "Due: Jan 2025" in result
 

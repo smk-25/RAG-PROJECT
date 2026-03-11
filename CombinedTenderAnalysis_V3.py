@@ -409,17 +409,34 @@ def _linearize_table(df: "pd.DataFrame") -> str:
     This NL summary is prepended to every table chunk so that the combined
     text has much higher semantic similarity to natural-language queries —
     embedding models score raw Markdown pipe tables poorly against prose.
-    Example: "Table with columns: Payment Term, Value.
-               Rows: Advance | 30%; On delivery | 50%."
+
+    Each row is serialised in key-value format (e.g. "Column: Value") so the
+    embedding captures the explicit mapping between headers and cell values.
+    This is critical for queries like "What is the mobilization cost?" to
+    match a row where "Item: Mobilization, Cost: $10,000" is present.
+    Without this, the previous pipe-separated format ("Mobilization | $10,000")
+    had low cosine similarity to natural-language queries, causing table chunks
+    to fall outside the top-K retrieval results and queries about table data to
+    go unanswered.
+
+    Example output:
+        "Table with columns: Payment Term, Value.
+         Rows: Payment Term: Advance, Value: 30%;
+               Payment Term: On delivery, Value: 50%."
     """
     if df.empty:
         return ""
     headers = [str(c) for c in df.columns if str(c).strip() not in ("", "None")]
     rows = []
     for _, row in df.iterrows():
-        row_vals = " | ".join(str(v) for v in row if pd.notna(v) and str(v).strip())
-        if row_vals:
-            rows.append(row_vals)
+        kv_pairs = []
+        for h, v in zip(df.columns, row):
+            h_str = str(h).strip()
+            v_str = str(v).strip() if pd.notna(v) else ""
+            if h_str and h_str not in ("None",) and v_str:
+                kv_pairs.append(f"{h_str}: {v_str}")
+        if kv_pairs:
+            rows.append(", ".join(kv_pairs))
     col_str = ", ".join(headers) if headers else "unknown columns"
     row_str = "; ".join(rows[:MAX_LINEARIZED_ROWS])
     suffix = f" (and {len(rows) - MAX_LINEARIZED_ROWS} more rows)" if len(rows) > MAX_LINEARIZED_ROWS else ""
@@ -962,6 +979,7 @@ INSTRUCTIONS:
 4. Distinguish Mandatory (must/shall) vs Optional.
 5. Professional, short paragraphs. Do NOT include page numbers, section numbers, clause numbers, IDs, or any citation markers inside the answer text — citations are displayed separately.
 6. Output: Plain text response only, no inline references.
+7. If the context contains table data (sections marked with [TABLE DATA - PAGE N TABLE N]: or formatted as Markdown tables with | separators), carefully read each column header and its corresponding row values to extract relevant information. Tables often contain key figures, schedules, specifications, or lists — do not skip them.
 ANSWER:"""
         return self.llm.invoke([HumanMessage(content=p)]).content
 
