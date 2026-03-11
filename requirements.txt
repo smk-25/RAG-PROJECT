@@ -8,6 +8,7 @@ sentence-transformers==5.1.2
 transformers==4.57.1
 torch
 pymupdf
+pymupdf4llm
 pypdf
 rank-bm25
 matplotlib
