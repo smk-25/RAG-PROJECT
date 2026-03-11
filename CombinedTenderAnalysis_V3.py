@@ -2429,17 +2429,41 @@ else:
     f_sum = st.file_uploader("Upload PDFs for Analysis", type="pdf", accept_multiple_files=True)
     q_sum = st.text_area("Analysis Queries (one per line):", placeholder="e.g., What are the total financial liabilities?")
     
-    final_res = []  # initialise so display code below is safe even when button hasn't been clicked
+    # Persist analysis results and context across Streamlit reruns so that
+    # interactive widgets inside the result section (tabs, expanders, download
+    # and preview buttons) remain visible after any widget interaction triggers
+    # a rerun without the user re-clicking the analysis button.
+    _ss_defaults: dict = {
+        "sum_final_res": [],       # list of per-query result dicts
+        "sum_chunks": [],          # context chunks for citation rendering
+        "sum_s_obj": s_obj,        # analysis objective used for the stored results
+        "_sum_pending_cleanup": [], # temp file paths awaiting deletion
+    }
+    for _sk, _default in _ss_defaults.items():
+        if _sk not in st.session_state:
+            st.session_state[_sk] = _default
     if st.button("🔍 Perform Deep Analysis", use_container_width=True):
         if not f_sum or not gem_key or not q_sum.strip(): st.error("Missing Files/Key/Query"); st.stop()
-        
+        # Clean up any temp files left over from a previous failed/interrupted run.
+        for _tf in st.session_state.get("_sum_pending_cleanup", []):
+            try: os.unlink(_tf)
+            except OSError: pass
+        # Clear stale results and register a fresh pending-cleanup list.
+        st.session_state.update({"sum_final_res": [], "sum_chunks": [], "sum_s_obj": s_obj, "_sum_pending_cleanup": []})
         with st.status("Analyzing Documents...", expanded=True) as status:
             client = genai.Client(api_key=gem_key)
             all_p, all_f, temp_files = [], [], []
             for f in f_sum:
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as t:
-                    temp_files.append(t.name); t.write(f.getbuffer()); t.flush()
-                    p, fl = extract_pages_sum(t.name); all_p.extend(p); all_f.extend(fl)
+                    t.write(f.getbuffer())
+                    _tmp_path = t.name
+                # File is now closed; safe to read on all platforms (avoids
+                # Windows file-lock issues and ensures all data is flushed).
+                # Register for deferred cleanup in case st.stop() exits early.
+                temp_files.append(_tmp_path)
+                st.session_state["_sum_pending_cleanup"].append(_tmp_path)
+                p, fl = extract_pages_sum(_tmp_path)
+                all_p.extend(p); all_f.extend(fl)
             st.write(f"Chunking {len(all_p)} pages...")
             chunks = semantic_chunk_pages_sum(all_p, all_f, max_tok=s_max_tk, overlap=s_over)
             # Free raw page text — no longer needed once chunks are built.
@@ -2584,282 +2608,292 @@ else:
                 st.error(f"Analysis failed: {_analysis_exc}. Please try again — no page reload needed.")
                 st.stop()
             status.update(label="Analysis Complete!", state="complete", expanded=False)
+            # Persist results and context for the session-state-driven display below.
+            st.session_state["sum_final_res"] = final_res
+            st.session_state["sum_chunks"] = chunks
+            st.session_state["sum_s_obj"] = s_obj
 
-        for ri, r in enumerate(final_res):
-            st.markdown(f"### 📋 Analysis Goal: {r['query']}")
-            if isinstance(r["result"], dict) and "error" in r["result"]: st.error(r["result"]["error"]); continue
-            
-            conf = r.get('conf', {})
-            render_metric_cards(r.get('chunk_count', r.get('mapped_count', 0)), r['total_t'], conf.get('overall_confidence', 0.0))
-
-            with st.expander("🔍 Confidence Score Breakdown", expanded=False):
-                sc_col1, sc_col2, sc_col3, sc_col4 = st.columns(4)
-                score_details = [
-                    ("📄 Snippet Coverage",    conf.get('snippet_coverage', 0.0),    "Weight: 25%", "Number of context chunks mapped to the query"),
-                    ("🧩 Result Coherence",    conf.get('result_coherence', 0.0),    "Weight: 25%", "Completeness of structured AI output fields"),
-                    ("📊 Information Density", conf.get('information_density', 0.0), "Weight: 20%", "Richness of response relative to query length"),
-                    ("📌 Citation Confidence", conf.get('citation_confidence', 0.0), "Weight: 30%", "Unique page citations grounding the result"),
-                ]
-                for col, (label, score, weight, desc) in zip([sc_col1, sc_col2, sc_col3, sc_col4], score_details):
-                    sc = "#EF4444" if score < 0.3 else "#F59E0B" if score < 0.7 else "#10B981"
-                    with col:
-                        st.markdown(f"""
-                        <div style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:0.75rem;text-align:center;">
-                            <div style="font-size:0.72rem;color:#9ca3af;margin-bottom:3px;">{weight}</div>
-                            <div style="font-size:0.82rem;font-weight:600;color:#374151;margin-bottom:6px;">{label}</div>
-                            <div style="font-size:1.5rem;font-weight:700;color:{sc};">{score:.1%}</div>
-                            <div style="font-size:0.7rem;color:#9ca3af;margin-top:5px;">{desc}</div>
-                        </div>""", unsafe_allow_html=True)
-
-            # Action Tabs for V2
-            tabs_list = ["📊 Data Visualization", "🖼️ Context Preview", "📥 Export & Raw"]
-            if s_obj == "Overall Summary & Voice":
-                tabs_list.insert(1, "🎤 Audio Briefing")
-            
-            atabs = st.tabs(tabs_list)
-            
-            # Dynamically handle tab assignment
-            visual_tab = atabs[0]
-            if s_obj == "Overall Summary & Voice":
-                audio_tab = atabs[1]
-                context_tab = atabs[2]
-                export_tab = atabs[3]
-            else:
-                context_tab = atabs[1]
-                export_tab = atabs[2]
-            
-            with visual_tab:
-                # Dashboard logic
-                if s_obj == "Entity Dashboard" and "dashboard" in r["result"]:
-                    dash = r["result"]["dashboard"]
-                    # Category summary
-                    cat_counts = {cat: len(items) for cat, items in dash.items() if isinstance(items, list) and items}
-                    if cat_counts:
-                        st.markdown("#### 📊 Category Summary")
-                        cc_cols = st.columns(min(len(cat_counts), 4))
-                        for i, (cat, cnt) in enumerate(cat_counts.items()):
-                            with cc_cols[i % len(cc_cols)]:
-                                st.metric(cat, cnt)
-                        st.markdown("---")
-                    for cat, items in dash.items():
-                        if items and isinstance(items, list):
-                            display_ents = [e for e in items if isinstance(e, dict)]
-                            total_ents = len(display_ents)
-                            if total_ents > MAX_DISPLAY_ITEMS:
-                                st.caption(f"⚠️ Showing first {MAX_DISPLAY_ITEMS} of {total_ents} items. Download Excel/Word to view all.")
-                                display_ents = display_ents[:MAX_DISPLAY_ITEMS]
-                            if display_ents:
-                                st.markdown(f"**{cat}** ({total_ents})")
-                            for idx, ent in enumerate(display_ents):
-                                label = f"{idx+1}. {ent.get('entity', 'Entity')} | Pages: {ent.get('pages', [])}"
-                                with st.expander(label, expanded=False):
-                                    st.write(f"**Context:** {ent.get('context', 'N/A')}")
-                                    if ent.get('evidence'):
-                                        st.markdown(f"**Evidence:** *\"{ent['evidence']}\"*")
-                                    else:
-                                        st.warning("**Evidence:** Not captured")
-                elif s_obj == "Risk Assessment" and "risks" in r["result"]:
-                    risks = r["result"]["risks"]
-                    valid_risks = [rk for rk in risks if isinstance(rk, dict)]
-                    # Type/Level summary
-                    if valid_risks:
-                        st.markdown("#### 📊 Risk Summary by Type & Level")
-                        _LEVEL_ORDER = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
-                        type_counts = collections.Counter(rk.get('risk_type', 'Unknown') for rk in valid_risks)
-                        level_counts = collections.Counter(rk.get('risk_level', 'Unknown') for rk in valid_risks)
-                        rs_col1, rs_col2 = st.columns(2)
-                        with rs_col1:
-                            st.markdown("**By Type**")
-                            for t, cnt in sorted(type_counts.items(), key=lambda x: -x[1]):
-                                st.markdown(f"- {t}: **{cnt}**")
-                        with rs_col2:
-                            st.markdown("**By Level**")
-                            for lvl, cnt in sorted(level_counts.items(), key=lambda x: _LEVEL_ORDER.get(x[0], 99)):
-                                st.markdown(f"- {lvl}: **{cnt}**")
-                        st.markdown("---")
-                    display_risks = valid_risks
-                    if len(display_risks) > MAX_DISPLAY_ITEMS:
-                        st.caption(f"⚠️ Showing first {MAX_DISPLAY_ITEMS} of {len(display_risks)} items. Download Excel/Word to view all.")
-                        display_risks = display_risks[:MAX_DISPLAY_ITEMS]
-                    for idx, risk in enumerate(display_risks):
-                        label = f"{idx+1}. {risk.get('risk_type', 'Risk')} — {risk.get('risk_level', 'Unknown')} severity"
-                        with st.expander(label, expanded=False):
-                            st.write(f"**Clause:** {risk.get('clause', 'N/A')}")
-                            st.write(f"**Reason:** {risk.get('reason', 'N/A')}")
-                            if risk.get('evidence'):
-                                st.markdown(f"**Evidence:** *\"{risk['evidence']}\"*")
-                            else:
-                                st.warning("**Evidence:** Not captured")
-                            st.write(f"**Impact:** {risk.get('impact', 'N/A')}")
-                            st.caption(f"Pages: {risk.get('pages', [])}")
-                    risk_summary = r["result"].get("risk_summary")
-                    if risk_summary:
-                        st.info(f"**Risk Summary:** Total: {risk_summary.get('total_risks', 0)} | Critical: {risk_summary.get('critical_count', 0)} | High: {risk_summary.get('high_count', 0)} | Medium: {risk_summary.get('medium_count', 0)} | Low: {risk_summary.get('low_count', 0)}")
-                elif s_obj == "Ambiguity Scrutiny" and "ambiguities" in r["result"]:
-                    ambs = r["result"]["ambiguities"]
-                    valid_ambs = [a for a in ambs if isinstance(a, dict)]
-                    # Type/Severity summary
-                    if valid_ambs:
-                        st.markdown("#### 📊 Ambiguity Summary by Type & Severity")
-                        _LEVEL_ORDER = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
-                        atype_counts = collections.Counter(a.get('ambiguity_type', 'Unknown') for a in valid_ambs)
-                        asev_counts = collections.Counter(a.get('severity', 'Medium') for a in valid_ambs)
-                        as_col1, as_col2 = st.columns(2)
-                        with as_col1:
-                            st.markdown("**By Type**")
-                            for t, cnt in sorted(atype_counts.items(), key=lambda x: -x[1]):
-                                st.markdown(f"- {t}: **{cnt}**")
-                        with as_col2:
-                            st.markdown("**By Severity**")
-                            for sev, cnt in sorted(asev_counts.items(), key=lambda x: _LEVEL_ORDER.get(x[0], 99)):
-                                st.markdown(f"- {sev}: **{cnt}**")
-                        st.markdown("---")
-                    display_ambs = valid_ambs
-                    if len(display_ambs) > MAX_DISPLAY_ITEMS:
-                        st.caption(f"⚠️ Showing first {MAX_DISPLAY_ITEMS} of {len(display_ambs)} items. Download Excel/Word to view all.")
-                        display_ambs = display_ambs[:MAX_DISPLAY_ITEMS]
-                    for idx, a in enumerate(display_ambs):
-                        label = f"{idx+1}. {a.get('ambiguity_type', 'Ambiguity')} — {a.get('severity', 'Medium')} | Ref: {a.get('ambiguous_text', '')[:60]}"
-                        with st.expander(label, expanded=False):
-                            st.write(f"**Issue:** {a.get('issue', 'N/A')}")
-                            if a.get('evidence'):
-                                st.markdown(f"**Evidence:** *\"{a['evidence']}\"*")
-                            else:
-                                st.warning("**Evidence:** Not captured")
-                            st.warning(f"**Suggested Query:** {a.get('suggested_query', 'N/A')}")
-                            if a.get('recommendation'): st.info(f"**Recommendation:** {a.get('recommendation')}")
-                            st.caption(f"Pages: {a.get('pages', [])}")
-                elif s_obj == "Compliance Matrix" and "matrix" in r["result"]:
-                    matrix_items = r["result"]["matrix"]
-                    valid_items = [item for item in matrix_items if isinstance(item, dict)]
-                    # Category summary
-                    if valid_items:
-                        st.markdown("#### 📊 Requirements Summary by Category")
-                        cat_counts = collections.Counter(item.get('category', 'Uncategorized') for item in valid_items)
-                        total_reqs = len(valid_items)
-                        mandatory_count = sum(1 for item in valid_items if _resolve_mandatory_val(item.get("mandatory")))
-                        optional_count = total_reqs - mandatory_count
-                        cm_col1, cm_col2 = st.columns(2)
-                        with cm_col1:
-                            st.markdown("**By Category**")
-                            for cat, cnt in sorted(cat_counts.items(), key=lambda x: -x[1]):
-                                st.markdown(f"- {cat}: **{cnt}**")
-                        with cm_col2:
-                            st.markdown("**By Type**")
-                            st.markdown(f"- 🔴 Mandatory: **{mandatory_count}**")
-                            st.markdown(f"- 🟡 Optional: **{optional_count}**")
-                            st.markdown(f"- Total: **{total_reqs}**")
-                        st.markdown("---")
-                    display_items = valid_items
-                    if len(display_items) > MAX_DISPLAY_ITEMS:
-                        st.caption(f"⚠️ Showing first {MAX_DISPLAY_ITEMS} of {len(display_items)} items. Download Excel/Word to view all.")
-                        display_items = display_items[:MAX_DISPLAY_ITEMS]
-                    for idx, item in enumerate(display_items):
-                        mandatory_badge = "🔴 Mandatory" if _resolve_mandatory_val(item.get("mandatory")) else "🟡 Optional"
-                        label = f"{idx+1}. {item.get('item', 'Requirement')} — {mandatory_badge} | {item.get('category', 'N/A')}"
-                        with st.expander(label, expanded=False):
-                            st.write(f"**Detail:** {item.get('detail', 'N/A')}")
-                            if item.get('evidence'):
-                                st.markdown(f"**Evidence:** *\"{item['evidence']}\"*")
-                            else:
-                                st.warning("**Evidence:** Not captured")
-                            st.caption(f"Pages: {item.get('pages', [])}")
-                else:
-                    df = convert_result_to_dataframe(r["result"], s_obj)
-                    if df is not None: st.dataframe(df, use_container_width=True)
-                    # Type/domain summary for General Summary and Overall Summary & Voice
-                    key_findings = r["result"].get("key_findings") or []
-                    valid_kf = [kf for kf in key_findings if isinstance(kf, dict)]
-                    if valid_kf:
-                        st.markdown("#### 📊 Findings Summary")
-                        domain_counts = collections.Counter(kf.get('domain') or kf.get('type') or 'General' for kf in valid_kf)
-                        kf_cols = st.columns(min(len(domain_counts), 4))
-                        for i, (domain, cnt) in enumerate(sorted(domain_counts.items(), key=lambda x: -x[1])):
-                            with kf_cols[i % len(kf_cols)]:
-                                st.markdown(f"- {domain}: **{cnt}**")
-                        st.caption(f"Total findings: **{len(valid_kf)}**")
-                        st.markdown("---")
-                    if "summary" in r["result"]: st.info(r["result"]["summary"])
-                    if "overall_assessment" in r["result"]: st.success(f"**Overall Assessment:** {r['result']['overall_assessment']}")
-
-            if s_obj == "Overall Summary & Voice":
-                with audio_tab:
-                    st.markdown("### 🎤 AI Audio Briefing")
-                    script = r["result"].get("audio_script") or r["result"].get("summary")
-                    if script:
-                        with st.spinner("Generating High-Quality Audio Briefing..."):
-                            audio_bytes = generate_audio_briefing(script)
-                            if audio_bytes:
-                                st.audio(audio_bytes, format="audio/mp3")
-                                st.download_button("📥 Download Audio Briefing", audio_bytes, f"{sanitize_filename(r['query'])}_briefing.mp3", "audio/mp3")
-                            else:
-                                st.error("Failed to generate audio. Please check your internet connection/API settings.")
-                    else:
-                        st.warning("No script found to generate audio.")
-
-            with context_tab:
-                pgs = []
-                def _f(o):
-                    if isinstance(o, dict):
-                        for k, v in o.items():
-                            if k.lower() in ["page", "pages", "citations"]:
-                                if isinstance(v, list):
-                                    for x in v:
-                                        try: pgs.append(int(x))
-                                        except: pass
-                                else:
-                                    try: pgs.append(int(v))
-                                    except: pass
-                            else:
-                                _f(v)
-                    elif isinstance(o, list):
-                        for x in o: _f(x)
-                _f(r['result'])
-                if pgs:
-                    p_set = sorted(set(pgs))
-                    # Always render lightweight text citations (no images).
-                    render_page_level_citations_sum(chunks, p_set)
-                    # PDF page image preview is opt-in to avoid memory overload.
-                    if f_sum:
-                        _preview_key = f"show_ctx_preview_{ri}"
-                        if st.button("🖼️ Load PDF Page Previews (Memory Intensive)",
-                                     key=_preview_key,
-                                     help=f"Renders up to {MAX_PREVIEW_PAGES} PDF pages as images. Skip if document is large."):
-                            _pages_to_preview = p_set[:MAX_PREVIEW_PAGES]
-                            with st.spinner(f"Rendering {len(_pages_to_preview)} page(s)..."):
-                                try:
-                                    pdf_doc = fitz.open(stream=f_sum[0].getvalue(), filetype="pdf")
-                                    render_citation_preview_sum(pdf_doc, [{"page": p} for p in _pages_to_preview])
-                                    pdf_doc.close()
-                                except Exception as _prev_err:
-                                    st.error("Unable to load PDF previews. Please try with fewer pages or a smaller document.")
-                else:
-                    st.info("No page citations found in the result.")
-
-            with export_tab:
-                df = convert_result_to_dataframe(r["result"], s_obj)
-                excel_data = export_to_excel(df, r['query'], s_obj) if df is not None else None
-                word_data = export_to_word(df, r['query'], s_obj, result=r['result'])
-                if excel_data is not None or word_data is not None:
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        if excel_data is not None:
-                            st.download_button("📥 Excel", excel_data, f"{sanitize_filename(r['query'])}.xlsx", use_container_width=True)
-                    with col2:
-                        if word_data is not None:
-                            st.download_button("📥 Word", word_data, f"{sanitize_filename(r['query'])}.docx", use_container_width=True)
-                st.subheader("Raw AI Output")
-                st.json(r["result"])
-
-            st.markdown("---")
-            
+        # Cleanup temp files from this successful run and clear the pending list.
         for tf in temp_files:
             try: os.unlink(tf)
-            except: pass
-        # Free large in-memory objects once display is complete to reduce
-        # Streamlit's working-set memory before the next analysis run.
+            except OSError: pass
+        st.session_state["_sum_pending_cleanup"] = []
+        # Free large in-memory objects to reduce Streamlit's working-set memory.
         if 'chunks' in locals():
             del chunks
-        if 'final_res' in locals():
-            del final_res
         gc.collect()
+
+    # ----- Result display (runs on EVERY Streamlit rerun, not just button click) -----
+    # Reading from session state ensures the results remain visible when the user
+    # interacts with tabs, expanders, or download/preview buttons — all of which
+    # trigger a Streamlit rerun that would otherwise clear the button state.
+    _disp_s_obj = st.session_state.get("sum_s_obj", s_obj)
+    _disp_chunks = st.session_state.get("sum_chunks", [])
+    for ri, r in enumerate(st.session_state.get("sum_final_res", [])):
+        st.markdown(f"### 📋 Analysis Goal: {r['query']}")
+        if isinstance(r["result"], dict) and "error" in r["result"]: st.error(r["result"]["error"]); continue
+        
+        conf = r.get('conf', {})
+        render_metric_cards(r.get('chunk_count', r.get('mapped_count', 0)), r['total_t'], conf.get('overall_confidence', 0.0))
+
+        with st.expander("🔍 Confidence Score Breakdown", expanded=False):
+            sc_col1, sc_col2, sc_col3, sc_col4 = st.columns(4)
+            score_details = [
+                ("📄 Snippet Coverage",    conf.get('snippet_coverage', 0.0),    "Weight: 25%", "Number of context chunks mapped to the query"),
+                ("🧩 Result Coherence",    conf.get('result_coherence', 0.0),    "Weight: 25%", "Completeness of structured AI output fields"),
+                ("📊 Information Density", conf.get('information_density', 0.0), "Weight: 20%", "Richness of response relative to query length"),
+                ("📌 Citation Confidence", conf.get('citation_confidence', 0.0), "Weight: 30%", "Unique page citations grounding the result"),
+            ]
+            for col, (label, score, weight, desc) in zip([sc_col1, sc_col2, sc_col3, sc_col4], score_details):
+                sc = "#EF4444" if score < 0.3 else "#F59E0B" if score < 0.7 else "#10B981"
+                with col:
+                    st.markdown(f"""
+                    <div style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:0.75rem;text-align:center;">
+                        <div style="font-size:0.72rem;color:#9ca3af;margin-bottom:3px;">{weight}</div>
+                        <div style="font-size:0.82rem;font-weight:600;color:#374151;margin-bottom:6px;">{label}</div>
+                        <div style="font-size:1.5rem;font-weight:700;color:{sc};">{score:.1%}</div>
+                        <div style="font-size:0.7rem;color:#9ca3af;margin-top:5px;">{desc}</div>
+                    </div>""", unsafe_allow_html=True)
+
+        # Action Tabs for V2
+        tabs_list = ["📊 Data Visualization", "🖼️ Context Preview", "📥 Export & Raw"]
+        if _disp_s_obj == "Overall Summary & Voice":
+            tabs_list.insert(1, "🎤 Audio Briefing")
+        
+        atabs = st.tabs(tabs_list)
+        
+        # Dynamically handle tab assignment
+        visual_tab = atabs[0]
+        if _disp_s_obj == "Overall Summary & Voice":
+            audio_tab = atabs[1]
+            context_tab = atabs[2]
+            export_tab = atabs[3]
+        else:
+            context_tab = atabs[1]
+            export_tab = atabs[2]
+        
+        with visual_tab:
+            # Dashboard logic
+            if _disp_s_obj == "Entity Dashboard" and "dashboard" in r["result"]:
+                dash = r["result"]["dashboard"]
+                # Category summary
+                cat_counts = {cat: len(items) for cat, items in dash.items() if isinstance(items, list) and items}
+                if cat_counts:
+                    st.markdown("#### 📊 Category Summary")
+                    cc_cols = st.columns(min(len(cat_counts), 4))
+                    for i, (cat, cnt) in enumerate(cat_counts.items()):
+                        with cc_cols[i % len(cc_cols)]:
+                            st.metric(cat, cnt)
+                    st.markdown("---")
+                for cat, items in dash.items():
+                    if items and isinstance(items, list):
+                        display_ents = [e for e in items if isinstance(e, dict)]
+                        total_ents = len(display_ents)
+                        if total_ents > MAX_DISPLAY_ITEMS:
+                            st.caption(f"⚠️ Showing first {MAX_DISPLAY_ITEMS} of {total_ents} items. Download Excel/Word to view all.")
+                            display_ents = display_ents[:MAX_DISPLAY_ITEMS]
+                        if display_ents:
+                            st.markdown(f"**{cat}** ({total_ents})")
+                        for idx, ent in enumerate(display_ents):
+                            label = f"{idx+1}. {ent.get('entity', 'Entity')} | Pages: {ent.get('pages', [])}"
+                            with st.expander(label, expanded=False):
+                                st.write(f"**Context:** {ent.get('context', 'N/A')}")
+                                if ent.get('evidence'):
+                                    st.markdown(f"**Evidence:** *\"{ent['evidence']}\"*")
+                                else:
+                                    st.warning("**Evidence:** Not captured")
+            elif _disp_s_obj == "Risk Assessment" and "risks" in r["result"]:
+                risks = r["result"]["risks"]
+                valid_risks = [rk for rk in risks if isinstance(rk, dict)]
+                # Type/Level summary
+                if valid_risks:
+                    st.markdown("#### 📊 Risk Summary by Type & Level")
+                    _LEVEL_ORDER = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
+                    type_counts = collections.Counter(rk.get('risk_type', 'Unknown') for rk in valid_risks)
+                    level_counts = collections.Counter(rk.get('risk_level', 'Unknown') for rk in valid_risks)
+                    rs_col1, rs_col2 = st.columns(2)
+                    with rs_col1:
+                        st.markdown("**By Type**")
+                        for t, cnt in sorted(type_counts.items(), key=lambda x: -x[1]):
+                            st.markdown(f"- {t}: **{cnt}**")
+                    with rs_col2:
+                        st.markdown("**By Level**")
+                        for lvl, cnt in sorted(level_counts.items(), key=lambda x: _LEVEL_ORDER.get(x[0], 99)):
+                            st.markdown(f"- {lvl}: **{cnt}**")
+                    st.markdown("---")
+                display_risks = valid_risks
+                if len(display_risks) > MAX_DISPLAY_ITEMS:
+                    st.caption(f"⚠️ Showing first {MAX_DISPLAY_ITEMS} of {len(display_risks)} items. Download Excel/Word to view all.")
+                    display_risks = display_risks[:MAX_DISPLAY_ITEMS]
+                for idx, risk in enumerate(display_risks):
+                    label = f"{idx+1}. {risk.get('risk_type', 'Risk')} — {risk.get('risk_level', 'Unknown')} severity"
+                    with st.expander(label, expanded=False):
+                        st.write(f"**Clause:** {risk.get('clause', 'N/A')}")
+                        st.write(f"**Reason:** {risk.get('reason', 'N/A')}")
+                        if risk.get('evidence'):
+                            st.markdown(f"**Evidence:** *\"{risk['evidence']}\"*")
+                        else:
+                            st.warning("**Evidence:** Not captured")
+                        st.write(f"**Impact:** {risk.get('impact', 'N/A')}")
+                        st.caption(f"Pages: {risk.get('pages', [])}")
+                risk_summary = r["result"].get("risk_summary")
+                if risk_summary:
+                    st.info(f"**Risk Summary:** Total: {risk_summary.get('total_risks', 0)} | Critical: {risk_summary.get('critical_count', 0)} | High: {risk_summary.get('high_count', 0)} | Medium: {risk_summary.get('medium_count', 0)} | Low: {risk_summary.get('low_count', 0)}")
+            elif _disp_s_obj == "Ambiguity Scrutiny" and "ambiguities" in r["result"]:
+                ambs = r["result"]["ambiguities"]
+                valid_ambs = [a for a in ambs if isinstance(a, dict)]
+                # Type/Severity summary
+                if valid_ambs:
+                    st.markdown("#### 📊 Ambiguity Summary by Type & Severity")
+                    _LEVEL_ORDER = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
+                    atype_counts = collections.Counter(a.get('ambiguity_type', 'Unknown') for a in valid_ambs)
+                    asev_counts = collections.Counter(a.get('severity', 'Medium') for a in valid_ambs)
+                    as_col1, as_col2 = st.columns(2)
+                    with as_col1:
+                        st.markdown("**By Type**")
+                        for t, cnt in sorted(atype_counts.items(), key=lambda x: -x[1]):
+                            st.markdown(f"- {t}: **{cnt}**")
+                    with as_col2:
+                        st.markdown("**By Severity**")
+                        for sev, cnt in sorted(asev_counts.items(), key=lambda x: _LEVEL_ORDER.get(x[0], 99)):
+                            st.markdown(f"- {sev}: **{cnt}**")
+                    st.markdown("---")
+                display_ambs = valid_ambs
+                if len(display_ambs) > MAX_DISPLAY_ITEMS:
+                    st.caption(f"⚠️ Showing first {MAX_DISPLAY_ITEMS} of {len(display_ambs)} items. Download Excel/Word to view all.")
+                    display_ambs = display_ambs[:MAX_DISPLAY_ITEMS]
+                for idx, a in enumerate(display_ambs):
+                    label = f"{idx+1}. {a.get('ambiguity_type', 'Ambiguity')} — {a.get('severity', 'Medium')} | Ref: {a.get('ambiguous_text', '')[:60]}"
+                    with st.expander(label, expanded=False):
+                        st.write(f"**Issue:** {a.get('issue', 'N/A')}")
+                        if a.get('evidence'):
+                            st.markdown(f"**Evidence:** *\"{a['evidence']}\"*")
+                        else:
+                            st.warning("**Evidence:** Not captured")
+                        st.warning(f"**Suggested Query:** {a.get('suggested_query', 'N/A')}")
+                        if a.get('recommendation'): st.info(f"**Recommendation:** {a.get('recommendation')}")
+                        st.caption(f"Pages: {a.get('pages', [])}")
+            elif _disp_s_obj == "Compliance Matrix" and "matrix" in r["result"]:
+                matrix_items = r["result"]["matrix"]
+                valid_items = [item for item in matrix_items if isinstance(item, dict)]
+                # Category summary
+                if valid_items:
+                    st.markdown("#### 📊 Requirements Summary by Category")
+                    cat_counts = collections.Counter(item.get('category', 'Uncategorized') for item in valid_items)
+                    total_reqs = len(valid_items)
+                    mandatory_count = sum(1 for item in valid_items if _resolve_mandatory_val(item.get("mandatory")))
+                    optional_count = total_reqs - mandatory_count
+                    cm_col1, cm_col2 = st.columns(2)
+                    with cm_col1:
+                        st.markdown("**By Category**")
+                        for cat, cnt in sorted(cat_counts.items(), key=lambda x: -x[1]):
+                            st.markdown(f"- {cat}: **{cnt}**")
+                    with cm_col2:
+                        st.markdown("**By Type**")
+                        st.markdown(f"- 🔴 Mandatory: **{mandatory_count}**")
+                        st.markdown(f"- 🟡 Optional: **{optional_count}**")
+                        st.markdown(f"- Total: **{total_reqs}**")
+                    st.markdown("---")
+                display_items = valid_items
+                if len(display_items) > MAX_DISPLAY_ITEMS:
+                    st.caption(f"⚠️ Showing first {MAX_DISPLAY_ITEMS} of {len(display_items)} items. Download Excel/Word to view all.")
+                    display_items = display_items[:MAX_DISPLAY_ITEMS]
+                for idx, item in enumerate(display_items):
+                    mandatory_badge = "🔴 Mandatory" if _resolve_mandatory_val(item.get("mandatory")) else "🟡 Optional"
+                    label = f"{idx+1}. {item.get('item', 'Requirement')} — {mandatory_badge} | {item.get('category', 'N/A')}"
+                    with st.expander(label, expanded=False):
+                        st.write(f"**Detail:** {item.get('detail', 'N/A')}")
+                        if item.get('evidence'):
+                            st.markdown(f"**Evidence:** *\"{item['evidence']}\"*")
+                        else:
+                            st.warning("**Evidence:** Not captured")
+                        st.caption(f"Pages: {item.get('pages', [])}")
+            else:
+                df = convert_result_to_dataframe(r["result"], _disp_s_obj)
+                if df is not None: st.dataframe(df, use_container_width=True)
+                # Type/domain summary for General Summary and Overall Summary & Voice
+                key_findings = r["result"].get("key_findings") or []
+                valid_kf = [kf for kf in key_findings if isinstance(kf, dict)]
+                if valid_kf:
+                    st.markdown("#### 📊 Findings Summary")
+                    domain_counts = collections.Counter(kf.get('domain') or kf.get('type') or 'General' for kf in valid_kf)
+                    kf_cols = st.columns(min(len(domain_counts), 4))
+                    for i, (domain, cnt) in enumerate(sorted(domain_counts.items(), key=lambda x: -x[1])):
+                        with kf_cols[i % len(kf_cols)]:
+                            st.markdown(f"- {domain}: **{cnt}**")
+                    st.caption(f"Total findings: **{len(valid_kf)}**")
+                    st.markdown("---")
+                if "summary" in r["result"]: st.info(r["result"]["summary"])
+                if "overall_assessment" in r["result"]: st.success(f"**Overall Assessment:** {r['result']['overall_assessment']}")
+
+        if _disp_s_obj == "Overall Summary & Voice":
+            with audio_tab:
+                st.markdown("### 🎤 AI Audio Briefing")
+                script = r["result"].get("audio_script") or r["result"].get("summary")
+                if script:
+                    with st.spinner("Generating High-Quality Audio Briefing..."):
+                        audio_bytes = generate_audio_briefing(script)
+                        if audio_bytes:
+                            st.audio(audio_bytes, format="audio/mp3")
+                            st.download_button("📥 Download Audio Briefing", audio_bytes, f"{sanitize_filename(r['query'])}_briefing.mp3", "audio/mp3")
+                        else:
+                            st.error("Failed to generate audio. Please check your internet connection/API settings.")
+                else:
+                    st.warning("No script found to generate audio.")
+
+        with context_tab:
+            pgs = []
+            def _f(o):
+                if isinstance(o, dict):
+                    for k, v in o.items():
+                        if k.lower() in ["page", "pages", "citations"]:
+                            if isinstance(v, list):
+                                for x in v:
+                                    try: pgs.append(int(x))
+                                    except: pass
+                            else:
+                                try: pgs.append(int(v))
+                                except: pass
+                        else:
+                            _f(v)
+                elif isinstance(o, list):
+                    for x in o: _f(x)
+            _f(r['result'])
+            if pgs:
+                p_set = sorted(set(pgs))
+                # Always render lightweight text citations (no images).
+                render_page_level_citations_sum(_disp_chunks, p_set)
+                # PDF page image preview is opt-in to avoid memory overload.
+                if f_sum:
+                    _preview_key = f"show_ctx_preview_{ri}"
+                    if st.button("🖼️ Load PDF Page Previews (Memory Intensive)",
+                                 key=_preview_key,
+                                 help=f"Renders up to {MAX_PREVIEW_PAGES} PDF pages as images. Skip if document is large."):
+                        _pages_to_preview = p_set[:MAX_PREVIEW_PAGES]
+                        with st.spinner(f"Rendering {len(_pages_to_preview)} page(s)..."):
+                            try:
+                                pdf_doc = fitz.open(stream=f_sum[0].getvalue(), filetype="pdf")
+                                render_citation_preview_sum(pdf_doc, [{"page": p} for p in _pages_to_preview])
+                                pdf_doc.close()
+                            except Exception as _prev_err:
+                                st.error("Unable to load PDF previews. Please try with fewer pages or a smaller document.")
+            else:
+                st.info("No page citations found in the result.")
+
+        with export_tab:
+            df = convert_result_to_dataframe(r["result"], _disp_s_obj)
+            excel_data = export_to_excel(df, r['query'], _disp_s_obj) if df is not None else None
+            word_data = export_to_word(df, r['query'], _disp_s_obj, result=r['result'])
+            if excel_data is not None or word_data is not None:
+                col1, col2 = st.columns(2)
+                with col1:
+                    if excel_data is not None:
+                        st.download_button("📥 Excel", excel_data, f"{sanitize_filename(r['query'])}.xlsx", use_container_width=True)
+                with col2:
+                    if word_data is not None:
+                        st.download_button("📥 Word", word_data, f"{sanitize_filename(r['query'])}.docx", use_container_width=True)
+            st.subheader("Raw AI Output")
+            st.json(r["result"])
+
+        st.markdown("---")
+        
