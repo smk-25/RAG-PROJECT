@@ -239,6 +239,8 @@ MAX_CITATION_SENTENCES = 50        # Cap sentences fed into citation embedding p
 MAX_CHUNKS_WARNING_THRESHOLD = 1500  # Warn user when chunk count is very high
 REDUCE_BATCH_THRESHOLD = 50        # Max findings before switching to hierarchical reduce
 MAX_LINEARIZED_ROWS = 10           # Max table rows included in NL linearisation prefix
+MAX_DISPLAY_ITEMS = 50             # Max items rendered per objective section before truncation
+MAX_PREVIEW_PAGES = 10             # Max PDF pages rendered as images in the context preview
 # Common English stop-words excluded from evidence chunk-search scoring so that
 # low-value tokens (e.g. "the", "and") do not dominate the relevance score.
 _EVIDENCE_STOP_WORDS = frozenset({
@@ -1118,7 +1120,7 @@ class ConcurrencyManager:
         return self._sem
 
 
-_SUM_CONCURRENCY_MGR = ConcurrencyManager(2)
+_SUM_CONCURRENCY_MGR = ConcurrencyManager(4)
 
 
 class TokenBucket:
@@ -2265,8 +2267,8 @@ with st.sidebar:
         s_obj = st.selectbox("Analysis Objective", ["General Summary", "Overall Summary & Voice", "Compliance Matrix", "Risk Assessment", "Entity Dashboard", "Ambiguity Scrutiny"])
         with st.expander("Advanced Summary Tuning"):
             s_model = st.text_input("Model", value="gemini-2.5-flash")
-            s_rpm = st.number_input("Target RPM", 1, 60, 4)
-            s_batch = st.number_input("Batch size", 5, 50, 10)
+            s_rpm = st.number_input("Target RPM", 1, 60, 10)
+            s_batch = st.number_input("Batch size", 5, 50, 15)
             s_max_tk = st.number_input("Max tokens/chunk", 500, 32000, 8000)
             s_over = st.number_input("Overlap sentences", 0, 20, 5)
 
@@ -2544,10 +2546,16 @@ else:
                             else {}
                         )
 
+                    # Compute confidence score immediately and free mapped to save memory.
+                    _conf = compute_confidence_score_sum(mapped, red, q)
+                    _mapped_count = len(mapped)
+                    del mapped
+
                     res.append({
                         "query": q, "result": red,
                         "map_t": t_m - t0, "red_t": time.time() - t_m,
-                        "mapped": mapped, "total_t": time.time() - t0,
+                        "conf": _conf, "mapped_count": _mapped_count,
+                        "total_t": time.time() - t0,
                         "chunk_count": len(chunks),
                     })
                 return res
@@ -2577,20 +2585,20 @@ else:
                 st.stop()
             status.update(label="Analysis Complete!", state="complete", expanded=False)
 
-        for r in final_res:
+        for ri, r in enumerate(final_res):
             st.markdown(f"### 📋 Analysis Goal: {r['query']}")
             if isinstance(r["result"], dict) and "error" in r["result"]: st.error(r["result"]["error"]); continue
             
-            conf = compute_confidence_score_sum(r['mapped'], r['result'], r['query'])
-            render_metric_cards(r.get('chunk_count', len(r['mapped'])), r['total_t'], conf['overall_confidence'])
+            conf = r.get('conf', {})
+            render_metric_cards(r.get('chunk_count', r.get('mapped_count', 0)), r['total_t'], conf.get('overall_confidence', 0.0))
 
             with st.expander("🔍 Confidence Score Breakdown", expanded=False):
                 sc_col1, sc_col2, sc_col3, sc_col4 = st.columns(4)
                 score_details = [
-                    ("📄 Snippet Coverage",    conf['snippet_coverage'],    "Weight: 25%", "Number of context chunks mapped to the query"),
-                    ("🧩 Result Coherence",    conf['result_coherence'],    "Weight: 25%", "Completeness of structured AI output fields"),
-                    ("📊 Information Density", conf['information_density'], "Weight: 20%", "Richness of response relative to query length"),
-                    ("📌 Citation Confidence", conf['citation_confidence'], "Weight: 30%", "Unique page citations grounding the result"),
+                    ("📄 Snippet Coverage",    conf.get('snippet_coverage', 0.0),    "Weight: 25%", "Number of context chunks mapped to the query"),
+                    ("🧩 Result Coherence",    conf.get('result_coherence', 0.0),    "Weight: 25%", "Completeness of structured AI output fields"),
+                    ("📊 Information Density", conf.get('information_density', 0.0), "Weight: 20%", "Richness of response relative to query length"),
+                    ("📌 Citation Confidence", conf.get('citation_confidence', 0.0), "Weight: 30%", "Unique page citations grounding the result"),
                 ]
                 for col, (label, score, weight, desc) in zip([sc_col1, sc_col2, sc_col3, sc_col4], score_details):
                     sc = "#EF4444" if score < 0.3 else "#F59E0B" if score < 0.7 else "#10B981"
@@ -2635,18 +2643,21 @@ else:
                         st.markdown("---")
                     for cat, items in dash.items():
                         if items and isinstance(items, list):
-                            st.markdown(f"**{cat}** ({len(items)})")
-                            for idx, ent in enumerate(items):
-                                if not isinstance(ent, dict): continue
-                                with st.container():
-                                    st.markdown(f"**{idx+1}. {ent.get('entity', 'Entity')}**")
+                            display_ents = [e for e in items if isinstance(e, dict)]
+                            total_ents = len(display_ents)
+                            if total_ents > MAX_DISPLAY_ITEMS:
+                                st.caption(f"⚠️ Showing first {MAX_DISPLAY_ITEMS} of {total_ents} items. Download Excel/Word to view all.")
+                                display_ents = display_ents[:MAX_DISPLAY_ITEMS]
+                            if display_ents:
+                                st.markdown(f"**{cat}** ({total_ents})")
+                            for idx, ent in enumerate(display_ents):
+                                label = f"{idx+1}. {ent.get('entity', 'Entity')} | Pages: {ent.get('pages', [])}"
+                                with st.expander(label, expanded=False):
                                     st.write(f"**Context:** {ent.get('context', 'N/A')}")
                                     if ent.get('evidence'):
                                         st.markdown(f"**Evidence:** *\"{ent['evidence']}\"*")
                                     else:
                                         st.warning("**Evidence:** Not captured")
-                                    st.caption(f"Pages: {ent.get('pages', [])}")
-                                    st.markdown("---")
                 elif s_obj == "Risk Assessment" and "risks" in r["result"]:
                     risks = r["result"]["risks"]
                     valid_risks = [rk for rk in risks if isinstance(rk, dict)]
@@ -2666,9 +2677,13 @@ else:
                             for lvl, cnt in sorted(level_counts.items(), key=lambda x: _LEVEL_ORDER.get(x[0], 99)):
                                 st.markdown(f"- {lvl}: **{cnt}**")
                         st.markdown("---")
-                    for idx, risk in enumerate(valid_risks):
-                        with st.container():
-                            st.markdown(f"**{idx+1}. {risk.get('risk_type', 'Risk')}** — `{risk.get('risk_level', 'Unknown')}` severity")
+                    display_risks = valid_risks
+                    if len(display_risks) > MAX_DISPLAY_ITEMS:
+                        st.caption(f"⚠️ Showing first {MAX_DISPLAY_ITEMS} of {len(display_risks)} items. Download Excel/Word to view all.")
+                        display_risks = display_risks[:MAX_DISPLAY_ITEMS]
+                    for idx, risk in enumerate(display_risks):
+                        label = f"{idx+1}. {risk.get('risk_type', 'Risk')} — {risk.get('risk_level', 'Unknown')} severity"
+                        with st.expander(label, expanded=False):
                             st.write(f"**Clause:** {risk.get('clause', 'N/A')}")
                             st.write(f"**Reason:** {risk.get('reason', 'N/A')}")
                             if risk.get('evidence'):
@@ -2677,7 +2692,6 @@ else:
                                 st.warning("**Evidence:** Not captured")
                             st.write(f"**Impact:** {risk.get('impact', 'N/A')}")
                             st.caption(f"Pages: {risk.get('pages', [])}")
-                            st.markdown("---")
                     risk_summary = r["result"].get("risk_summary")
                     if risk_summary:
                         st.info(f"**Risk Summary:** Total: {risk_summary.get('total_risks', 0)} | Critical: {risk_summary.get('critical_count', 0)} | High: {risk_summary.get('high_count', 0)} | Medium: {risk_summary.get('medium_count', 0)} | Low: {risk_summary.get('low_count', 0)}")
@@ -2700,19 +2714,21 @@ else:
                             for sev, cnt in sorted(asev_counts.items(), key=lambda x: _LEVEL_ORDER.get(x[0], 99)):
                                 st.markdown(f"- {sev}: **{cnt}**")
                         st.markdown("---")
-                    for idx, a in enumerate(valid_ambs):
-                        with st.container():
-                            st.markdown(f"**{idx+1}. {a.get('ambiguity_type', 'Ambiguity')}**")
+                    display_ambs = valid_ambs
+                    if len(display_ambs) > MAX_DISPLAY_ITEMS:
+                        st.caption(f"⚠️ Showing first {MAX_DISPLAY_ITEMS} of {len(display_ambs)} items. Download Excel/Word to view all.")
+                        display_ambs = display_ambs[:MAX_DISPLAY_ITEMS]
+                    for idx, a in enumerate(display_ambs):
+                        label = f"{idx+1}. {a.get('ambiguity_type', 'Ambiguity')} — {a.get('severity', 'Medium')} | Ref: {a.get('ambiguous_text', '')[:60]}"
+                        with st.expander(label, expanded=False):
                             st.write(f"**Issue:** {a.get('issue', 'N/A')}")
                             if a.get('evidence'):
-                                ev = a['evidence']
-                                st.markdown(f"**Evidence:** *\"{ev}\"*")
+                                st.markdown(f"**Evidence:** *\"{a['evidence']}\"*")
                             else:
                                 st.warning("**Evidence:** Not captured")
                             st.warning(f"**Suggested Query:** {a.get('suggested_query', 'N/A')}")
                             if a.get('recommendation'): st.info(f"**Recommendation:** {a.get('recommendation')}")
-                            st.caption(f"Ref: {a.get('ambiguous_text', 'Section')} | Severity: {a.get('severity', 'Medium')} | Pages: {a.get('pages', [])}")
-                            st.markdown("---")
+                            st.caption(f"Pages: {a.get('pages', [])}")
                 elif s_obj == "Compliance Matrix" and "matrix" in r["result"]:
                     matrix_items = r["result"]["matrix"]
                     valid_items = [item for item in matrix_items if isinstance(item, dict)]
@@ -2734,17 +2750,20 @@ else:
                             st.markdown(f"- 🟡 Optional: **{optional_count}**")
                             st.markdown(f"- Total: **{total_reqs}**")
                         st.markdown("---")
-                    for idx, item in enumerate(valid_items):
-                        with st.container():
-                            mandatory_badge = "🔴 Mandatory" if _resolve_mandatory_val(item.get("mandatory")) else "🟡 Optional"
-                            st.markdown(f"**{idx+1}. {item.get('item', 'Requirement')}** — {mandatory_badge} | Category: `{item.get('category', 'N/A')}`")
+                    display_items = valid_items
+                    if len(display_items) > MAX_DISPLAY_ITEMS:
+                        st.caption(f"⚠️ Showing first {MAX_DISPLAY_ITEMS} of {len(display_items)} items. Download Excel/Word to view all.")
+                        display_items = display_items[:MAX_DISPLAY_ITEMS]
+                    for idx, item in enumerate(display_items):
+                        mandatory_badge = "🔴 Mandatory" if _resolve_mandatory_val(item.get("mandatory")) else "🟡 Optional"
+                        label = f"{idx+1}. {item.get('item', 'Requirement')} — {mandatory_badge} | {item.get('category', 'N/A')}"
+                        with st.expander(label, expanded=False):
                             st.write(f"**Detail:** {item.get('detail', 'N/A')}")
                             if item.get('evidence'):
                                 st.markdown(f"**Evidence:** *\"{item['evidence']}\"*")
                             else:
                                 st.warning("**Evidence:** Not captured")
                             st.caption(f"Pages: {item.get('pages', [])}")
-                            st.markdown("---")
                 else:
                     df = convert_result_to_dataframe(r["result"], s_obj)
                     if df is not None: st.dataframe(df, use_container_width=True)
@@ -2798,11 +2817,24 @@ else:
                 _f(r['result'])
                 if pgs:
                     p_set = sorted(set(pgs))
+                    # Always render lightweight text citations (no images).
                     render_page_level_citations_sum(chunks, p_set)
+                    # PDF page image preview is opt-in to avoid memory overload.
                     if f_sum:
-                        pdf_doc = fitz.open(stream=f_sum[0].getvalue(), filetype="pdf")
-                        render_citation_preview_sum(pdf_doc, [{"page": p} for p in p_set])
-                        pdf_doc.close()
+                        _preview_key = f"show_ctx_preview_{ri}"
+                        if st.button("🖼️ Load PDF Page Previews (Memory Intensive)",
+                                     key=_preview_key,
+                                     help=f"Renders up to {MAX_PREVIEW_PAGES} PDF pages as images. Skip if document is large."):
+                            _pages_to_preview = p_set[:MAX_PREVIEW_PAGES]
+                            with st.spinner(f"Rendering {len(_pages_to_preview)} page(s)..."):
+                                try:
+                                    pdf_doc = fitz.open(stream=f_sum[0].getvalue(), filetype="pdf")
+                                    render_citation_preview_sum(pdf_doc, [{"page": p} for p in _pages_to_preview])
+                                    pdf_doc.close()
+                                except Exception as _prev_err:
+                                    st.error("Unable to load PDF previews. Please try with fewer pages or a smaller document.")
+                else:
+                    st.info("No page citations found in the result.")
 
             with export_tab:
                 df = convert_result_to_dataframe(r["result"], s_obj)
