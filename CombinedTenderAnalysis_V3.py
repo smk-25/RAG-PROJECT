@@ -194,6 +194,12 @@ try:
     import tiktoken as _tiktoken
 except Exception:
     _tiktoken = None
+try:
+    import pymupdf4llm as _pymupdf4llm
+    PYMUPDF4LLM_AVAILABLE = True
+except Exception:
+    _pymupdf4llm = None
+    PYMUPDF4LLM_AVAILABLE = False
 
 # --------------------------
 # Constants
@@ -232,6 +238,7 @@ EMBEDDING_BATCH_SIZE = 64          # Encode in batches to limit peak memory
 MAX_CITATION_SENTENCES = 50        # Cap sentences fed into citation embedding pass
 MAX_CHUNKS_WARNING_THRESHOLD = 1500  # Warn user when chunk count is very high
 REDUCE_BATCH_THRESHOLD = 50        # Max findings before switching to hierarchical reduce
+MAX_LINEARIZED_ROWS = 10           # Max table rows included in NL linearisation prefix
 # Common English stop-words excluded from evidence chunk-search scoring so that
 # low-value tokens (e.g. "the", "and") do not dominate the relevance score.
 _EVIDENCE_STOP_WORDS = frozenset({
@@ -320,12 +327,37 @@ def simple_sent_tokenize_shared(text: str) -> List[str]:
 
 _PROV_SPLIT_RE = re.compile(r"\n\s*(\[\d+\]\s*Source:|→\s*Source:|Source:|Source\s*[:\-])", flags=re.IGNORECASE)
 def strip_provenance(text: str) -> str:
+    """Remove inline provenance/citation markers from LLM-generated answers.
+
+    Handles patterns injected by the LLM when it cites page, section, clause,
+    or ID references inline, e.g.:
+      (Page 5), [Page 5], (p. 5), (pp. 3-5)
+      (Section 4.1), (Clause 3.2), (Clause 4.1.3)
+      (ID: abc123), [ID: abc123def0]
+      [Source: ...], → Source: ...
+      (chunk ...), [1]
+    """
     if not text: return ""
+    # Split off trailing source/citation blocks
     parts = _PROV_SPLIT_RE.split(text)
     cleaned = parts[0] if parts else text
+    # Remove (chunk ...) references
     cleaned = re.sub(r"\(chunk:?[^\)]*\)", "", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"[\[\(]\s*\d+\s*[\]\)]", "", cleaned)
+    # Remove inline ID references: (ID: abc123) or [ID: abc123]
+    cleaned = re.sub(r"[\[\(]\s*ID\s*:\s*[^\]\)]+[\]\)]", "", cleaned, flags=re.IGNORECASE)
+    # Remove page references: (Page 5), (page 3-4), [Page 5], (p. 5), (pp. 3-5)
+    cleaned = re.sub(r"[\[\(]\s*p{1,2}\.?\s*\d+(?:\s*[-–]\s*\d+)?[\]\)]", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"[\[\(]\s*page\s*\d+(?:\s*[-–]\s*\d+)?[\]\)]", "", cleaned, flags=re.IGNORECASE)
+    # Remove section references: (Section 4.1), [Section 4], (Sec. 4.1)
+    cleaned = re.sub(r"[\[\(]\s*sec(?:tion)?\.?\s*[\d\.]+[\]\)]", "", cleaned, flags=re.IGNORECASE)
+    # Remove clause references: (Clause 3.2.1), [Clause 4]
+    cleaned = re.sub(r"[\[\(]\s*clause\s*[\d\.]+[\]\)]", "", cleaned, flags=re.IGNORECASE)
+    # Remove simple numeric citation markers: [1], (1), [12]
+    cleaned = re.sub(r"[\[\(]\s*\d{1,3}\s*[\]\)]", "", cleaned)
+    # Collapse extra whitespace
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    # Remove spaces that ended up immediately before sentence-ending punctuation
+    cleaned = re.sub(r"\s+([.,;:!?])", r"\1", cleaned)
     return cleaned
 
 def compute_mean_support_score_shared(results: List[Dict[str, Any]]) -> float:
@@ -371,91 +403,277 @@ class RAGDocument:
         self.page_content = page_content
         self.metadata = metadata or {}
 
+def _linearize_table(df: "pd.DataFrame") -> str:
+    """Convert a DataFrame to a compact natural-language description.
+
+    This NL summary is prepended to every table chunk so that the combined
+    text has much higher semantic similarity to natural-language queries —
+    embedding models score raw Markdown pipe tables poorly against prose.
+    Example: "Table with columns: Payment Term, Value.
+               Rows: Advance | 30%; On delivery | 50%."
+    """
+    if df.empty:
+        return ""
+    headers = [str(c) for c in df.columns if str(c).strip() not in ("", "None")]
+    rows = []
+    for _, row in df.iterrows():
+        row_vals = " | ".join(str(v) for v in row if pd.notna(v) and str(v).strip())
+        if row_vals:
+            rows.append(row_vals)
+    col_str = ", ".join(headers) if headers else "unknown columns"
+    row_str = "; ".join(rows[:MAX_LINEARIZED_ROWS])
+    suffix = f" (and {len(rows) - MAX_LINEARIZED_ROWS} more rows)" if len(rows) > MAX_LINEARIZED_ROWS else ""
+    return f"Table with columns: {col_str}. Rows: {row_str}{suffix}."
+
+
+def _parse_markdown_table(md_table: str) -> "Optional[pd.DataFrame]":
+    """Parse a Markdown-formatted table string into a DataFrame for linearisation."""
+    try:
+        lines = [l for l in md_table.strip().split("\n") if "|" in l]
+        if len(lines) < 2:
+            return None
+        headers = [c.strip() for c in lines[0].split("|") if c.strip()]
+        # Find the separator row (contains only dashes, pipes, and spaces) and skip it
+        data_lines = []
+        for line in lines[1:]:
+            stripped = line.strip().strip("|")
+            if re.match(r"^[\s\-:|]+$", stripped):
+                continue  # skip separator row
+            data_lines.append(line)
+        rows = []
+        for line in data_lines:
+            vals = [c.strip() for c in line.split("|")]
+            vals = [v for v in vals if v != ""]
+            if vals:
+                while len(vals) < len(headers):
+                    vals.append("")
+                rows.append(vals[: len(headers)])
+        if not headers:
+            return None
+        return pd.DataFrame(rows, columns=headers)
+    except Exception:
+        return None
+
+
+def _split_markdown_into_docs(md_text: str, page: int) -> List[RAGDocument]:
+    """Split a page's Markdown text into separate prose and table RAGDocuments.
+
+    pymupdf4llm outputs Markdown where tables are represented as pipe-delimited
+    blocks.  Documents are a mixture of prose (majority) and tables (minority).
+    Separating them gives each table its own focused embedding so it can
+    compete fairly in Top-K retrieval instead of being diluted by surrounding
+    prose text.
+    """
+    docs: List[RAGDocument] = []
+    lines = md_text.split("\n")
+    prose_lines: List[str] = []
+    table_lines: List[str] = []
+    in_table = False
+    table_idx = 0
+
+    def _flush_table():
+        nonlocal table_idx
+        table_text = "\n".join(table_lines).strip()
+        if not table_text:
+            return
+        table_idx += 1
+        df = _parse_markdown_table(table_text)
+        linear = _linearize_table(df) if df is not None and not df.empty else ""
+        full_text = (
+            f"[TABLE DATA - PAGE {page} TABLE {table_idx}]:\n"
+            + (f"{linear}\n" if linear else "")
+            + table_text
+        )
+        docs.append(RAGDocument(
+            page_content=full_text,
+            metadata={"page": page, "chunk_type": "table", "table_index": table_idx},
+        ))
+
+    def _flush_prose():
+        prose_text = "\n".join(prose_lines).strip()
+        # Remove null bytes and collapse excessive whitespace
+        prose_text = prose_text.replace("\x00", " ")
+        prose_text = re.sub(r"\n{3,}", "\n\n", prose_text).strip()
+        if prose_text:
+            docs.append(RAGDocument(page_content=prose_text, metadata={"page": page}))
+
+    for line in lines:
+        stripped = line.strip()
+        # A Markdown table line starts and ends with '|' (header, separator, or data)
+        is_table_line = stripped.startswith("|") and "|" in stripped[1:]
+        if is_table_line:
+            if not in_table:
+                # Flush accumulated prose before starting a new table block
+                _flush_prose()
+                prose_lines.clear()
+                in_table = True
+            table_lines.append(line)
+        else:
+            if in_table:
+                # Flush completed table block before returning to prose
+                _flush_table()
+                table_lines.clear()
+                in_table = False
+            prose_lines.append(line)
+
+    # Flush whatever remains
+    if in_table:
+        _flush_table()
+    else:
+        _flush_prose()
+
+    return docs
+
+
+def load_pdf_with_pymupdf4llm(pdf_path: str) -> List[RAGDocument]:
+    """Primary PDF extractor using pymupdf4llm (best for mixed prose + tables).
+
+    pymupdf4llm converts each PDF page to clean Markdown via PyMuPDF's layout
+    engine, producing properly formatted Markdown tables alongside prose text.
+    It outperforms both PyPDFLoader (drops tables) and raw pdfplumber for
+    mixed documents because it understands reading order, multi-column layouts,
+    and table boundaries simultaneously.
+
+    Each page is split into separate RAGDocument objects:
+    - Prose text → standard chunk (split further by split_documents)
+    - Each table → dedicated chunk with chunk_type="table" + NL linearisation
+      prefix (never split further, gets its own focused embedding)
+    """
+    docs: List[RAGDocument] = []
+    try:
+        page_chunks = _pymupdf4llm.to_markdown(pdf_path, page_chunks=True, show_progress=False)
+        for idx, chunk in enumerate(page_chunks, start=1):
+            # page_chunks returns one dict per page; page number is 1-based
+            md_text = chunk.get("text", "")
+            if not md_text or not md_text.strip():
+                continue
+            # Infer page number from metadata if available, else fall back to list index
+            meta = chunk.get("metadata", {})
+            page_num = meta.get("page", 0) or idx
+            docs.extend(_split_markdown_into_docs(md_text, page_num))
+    except Exception as e:
+        st.warning(f"pymupdf4llm extraction failed ({e}); falling back to PyMuPDF+pdfplumber.")
+        return []
+    return docs
+
+
 def load_pdf_with_pymupdf(pdf_path: str) -> List[RAGDocument]:
+    """Fallback PDF extractor using raw PyMuPDF + pdfplumber.
+
+    Used when pymupdf4llm is unavailable or fails.  Emits prose and table
+    content as separate RAGDocument objects in the same way as
+    load_pdf_with_pymupdf4llm so the rest of the pipeline is unaffected.
     """
-    Extract full text from every PDF page using:
-    - PyMuPDF block-sorted extraction (preserves reading order for multi-column layouts)
-    - pdfplumber table detection (appends tables as Markdown so no content is lost)
-    - Text cleaning (null bytes, redundant whitespace)
-    Mirrors the extract_pages() approach from Summarizationcode.py.
-    """
-    docs = []
+    docs: List[RAGDocument] = []
     try:
         pdf_document = fitz.open(pdf_path)
         with pdfplumber.open(pdf_path) as pl_pdf:
             for page_num in range(len(pdf_document)):
                 page = pdf_document[page_num]
+                page_label = page_num + 1
 
-                # Block-sorted extraction preserves correct reading order for
-                # multi-column and complex layouts.
+                # Block-sorted prose extraction (correct reading order)
                 try:
                     blocks = page.get_text("blocks")
                     blocks = sorted(blocks, key=lambda b: (round(b[1], 1), round(b[0], 1)))
-                    text = "\n".join(
+                    prose = "\n".join(
                         b[4] for b in blocks if isinstance(b, (list, tuple)) and len(b) >= 5
                     )
                 except Exception:
-                    text = page.get_text()
+                    prose = page.get_text()
 
-                # Extract tables via pdfplumber and append as cleaned Markdown so
-                # tabular evidence is fully captured and not silently dropped.
+                prose = prose.replace("\x00", " ").replace("\r\n", "\n")
+                prose = re.sub(r"[ \t]+", " ", prose)
+                prose = re.sub(r"\n{3,}", "\n\n", prose).strip()
+                if prose:
+                    docs.append(RAGDocument(page_content=prose, metadata={"page": page_label}))
+
+                # Dedicated table chunks via pdfplumber
                 if page_num < len(pl_pdf.pages):
                     tables = pl_pdf.pages[page_num].extract_tables()
-                    for table in tables:
-                        if table:
-                            df_t = pd.DataFrame(table).dropna(how="all").dropna(axis=1, how="all")
-                            if not df_t.empty:
-                                text += (
-                                    f"\n\n[TABLE DATA - PAGE {page_num + 1}]:\n"
-                                    + df_t.to_markdown(index=False)
-                                    + "\n\n"
-                                )
+                    for t_idx, table in enumerate(tables):
+                        if not table:
+                            continue
+                        df_t = pd.DataFrame(table).dropna(how="all").dropna(axis=1, how="all")
+                        if df_t.empty:
+                            continue
+                        linear = _linearize_table(df_t)
+                        table_text = (
+                            f"[TABLE DATA - PAGE {page_label} TABLE {t_idx + 1}]:\n"
+                            + (f"{linear}\n" if linear else "")
+                            + df_t.to_markdown(index=False)
+                        )
+                        docs.append(RAGDocument(
+                            page_content=table_text,
+                            metadata={"page": page_label, "chunk_type": "table", "table_index": t_idx + 1},
+                        ))
 
-                # Normalise whitespace and remove null bytes that can corrupt
-                # downstream embeddings.
-                text = text.replace("\x00", " ").replace("\r\n", "\n")
-                text = re.sub(r"[ \t]+", " ", text)
-                text = re.sub(r"\n{3,}", "\n\n", text).strip()
-
-                if text:
-                    docs.append(RAGDocument(page_content=text, metadata={"page": page_num + 1}))
         pdf_document.close()
     except Exception as e:
         st.error(f"Error loading PDF: {e}")
     return docs
 
-def process_pdf(pdf_path: str) -> List[Any]:
-    """Load a PDF using PyPDFLoader (mirrors EnhancedRAG10.3.py logic).
 
-    Adds source_file, file_type, and file_hash metadata to every page document.
-    Falls back to load_pdf_with_pymupdf when PyPDFLoader / langchain is not
-    available in the environment.
+def process_pdf(pdf_path: str) -> List[Any]:
+    """Load a PDF and return a list of RAGDocument objects.
+
+    Extraction priority:
+    1. pymupdf4llm  — best for mixed prose + table documents; produces clean
+       Markdown with proper table syntax understood by the layout engine.
+    2. PyMuPDF + pdfplumber — robust fallback; emits the same prose/table
+       split via pdfplumber structured extraction.
+    3. PyPDFLoader  — last resort; plain text only, no table support.
+
+    Each table in the document is returned as a *separate* RAGDocument with
+    ``chunk_type="table"`` so it gets its own embedding and is never split
+    mid-row by the downstream text splitter.
     """
-    if not LANGCHAIN_PDF_AVAILABLE or PyPDFLoader is None:
-        st.write(f"Loading PDF: {Path(pdf_path).name}")
-        return load_pdf_with_pymupdf(pdf_path)
     st.write(f"Loading PDF: {Path(pdf_path).name}")
-    try:
-        loader = PyPDFLoader(pdf_path)
-        docs = loader.load()
-    except Exception as e:
-        st.error(f"PDF loader error: {e}")
-        return []
     try:
         file_hash = sha256_file_shared(pdf_path)
     except Exception:
         file_hash = None
+
+    # --- Primary: pymupdf4llm ---
+    docs: List[Any] = []
+    if PYMUPDF4LLM_AVAILABLE:
+        docs = load_pdf_with_pymupdf4llm(pdf_path)
+
+    # --- Fallback 1: PyMuPDF + pdfplumber ---
+    if not docs:
+        docs = load_pdf_with_pymupdf(pdf_path)
+
+    # --- Fallback 2: PyPDFLoader (plain text only) ---
+    if not docs and LANGCHAIN_PDF_AVAILABLE and PyPDFLoader is not None:
+        try:
+            loader = PyPDFLoader(pdf_path)
+            docs = loader.load()
+        except Exception as e:
+            st.error(f"PDF loader fallback error: {e}")
+            return []
+
+    if not docs:
+        return []
+
     for d in docs:
         d.metadata["source_file"] = Path(pdf_path).name
         d.metadata["file_type"] = "pdf"
         if file_hash:
             d.metadata["file_hash"] = file_hash
-    st.write(f"Loaded {len(docs)} pages")
+
+    prose_count = sum(1 for d in docs if d.metadata.get("chunk_type") != "table")
+    table_count = sum(1 for d in docs if d.metadata.get("chunk_type") == "table")
+    st.write(f"Loaded {prose_count} prose page(s) and {table_count} table chunk(s)")
     return docs
+
 
 def chunk_recursive_character(docs: List[RAGDocument], chunk_size: int = 800, chunk_overlap: int = 128) -> List[RAGDocument]:
     chunks = []
     for doc in docs:
+        # Table chunks are self-contained units — never split them.
+        if doc.metadata.get("chunk_type") == "table":
+            chunks.append(doc)
+            continue
         text = doc.page_content
         metadata = doc.metadata.copy()
         start = 0
@@ -471,6 +689,10 @@ def chunk_recursive_character(docs: List[RAGDocument], chunk_size: int = 800, ch
 def chunk_hybrid_token_semantic(docs: List[RAGDocument], chunk_size: int = 800, chunk_overlap: int = 128) -> List[RAGDocument]:
     chunks = []
     for doc in docs:
+        # Table chunks are self-contained units — never split them.
+        if doc.metadata.get("chunk_type") == "table":
+            chunks.append(doc)
+            continue
         text = doc.page_content
         metadata = doc.metadata.copy()
         try:
@@ -500,6 +722,10 @@ def chunk_hybrid_token_semantic(docs: List[RAGDocument], chunk_size: int = 800, 
 def chunk_fixed_context_window(docs: List[RAGDocument], window_size: int = 800) -> List[RAGDocument]:
     chunks = []
     for doc in docs:
+        # Table chunks are self-contained units — never split them.
+        if doc.metadata.get("chunk_type") == "table":
+            chunks.append(doc)
+            continue
         text = doc.page_content
         metadata = doc.metadata.copy()
         for i in range(0, len(text), window_size):
@@ -514,24 +740,33 @@ def apply_chunking_method(docs: List[RAGDocument], method: str, chunk_size: int 
     return chunk_recursive_character(docs, chunk_size, chunk_overlap)
 
 def split_documents(documents: List[Any], chunk_size: int = 800, chunk_overlap: int = 128, method: str = "Recursive") -> List[Any]:
-    """Split documents using RecursiveCharacterTextSplitter (mirrors EnhancedRAG10.3.py logic).
+    """Split documents using RecursiveCharacterTextSplitter.
 
-    Supports method names "Recursive", "Hybrid", and "Fixed-size" (matching
-    EnhancedRAG10.3.py).  Falls back to apply_chunking_method when the langchain
-    text splitter is unavailable.
+    Table chunks (chunk_type="table") are passed through unsplit — they are
+    self-contained units that must keep their NL linearisation prefix and full
+    Markdown rows together so they get a single, focused embedding.  Only
+    prose documents are fed to the text splitter.
+
+    Supports method names "Recursive", "Hybrid", and "Fixed-size".
+    Falls back to apply_chunking_method when langchain is unavailable.
     """
+    # Separate table chunks (pass-through) from prose chunks (to be split)
+    table_docs = [d for d in documents if getattr(d, "metadata", {}).get("chunk_type") == "table"]
+    prose_docs = [d for d in documents if getattr(d, "metadata", {}).get("chunk_type") != "table"]
+
     if not LANGCHAIN_PDF_AVAILABLE or RecursiveCharacterTextSplitter is None:
         _method_map = {
             "Recursive": "Recursive Character Splitter",
             "Hybrid": "Hybrid (Token+Semantic)",
             "Fixed-size": "Fixed Context Window",
         }
-        return apply_chunking_method(
-            documents,  # type: ignore[arg-type]
+        split_prose = apply_chunking_method(
+            prose_docs,  # type: ignore[arg-type]
             _method_map.get(method, "Recursive Character Splitter"),
             chunk_size,
             chunk_overlap,
         )
+        return split_prose + table_docs
 
     # Token-aware length function: uses tiktoken when available, else char/4 estimate
     if _tiktoken is not None:
@@ -554,9 +789,10 @@ def split_documents(documents: List[Any], chunk_size: int = 800, chunk_overlap: 
             length_function=length_fn,
             separators=["\n\n", "\n", " ", ""]
         )
-        split_docs = splitter.split_documents(documents)
-        st.write(f"Split into {len(split_docs)} chunks using Recursive method")
-        return split_docs
+        split_prose = splitter.split_documents(prose_docs)
+        all_chunks = split_prose + table_docs
+        st.write(f"Split into {len(split_prose)} prose chunks + {len(table_docs)} table chunk(s) = {len(all_chunks)} total")
+        return all_chunks
 
     elif method == "Hybrid":
         # Two-pass: first split on paragraph/line boundaries (semantic), then
@@ -568,8 +804,8 @@ def split_documents(documents: List[Any], chunk_size: int = 800, chunk_overlap: 
             length_function=length_fn,
             separators=["\n\n", "\n"]
         )
-        semantic_chunks = semantic_splitter.split_documents(documents)
-        final_chunks: List[Any] = []
+        semantic_chunks = semantic_splitter.split_documents(prose_docs)
+        final_prose: List[Any] = []
         for doc in semantic_chunks:
             if length_fn(doc.page_content) > chunk_size:
                 sub_splitter = RecursiveCharacterTextSplitter(
@@ -578,11 +814,12 @@ def split_documents(documents: List[Any], chunk_size: int = 800, chunk_overlap: 
                     length_function=length_fn,
                     separators=[" ", ""]
                 )
-                final_chunks.extend(sub_splitter.split_documents([doc]))
+                final_prose.extend(sub_splitter.split_documents([doc]))
             else:
-                final_chunks.append(doc)
-        st.write(f"Split into {len(final_chunks)} chunks using Hybrid method")
-        return final_chunks
+                final_prose.append(doc)
+        all_chunks = final_prose + table_docs
+        st.write(f"Split into {len(final_prose)} prose chunks + {len(table_docs)} table chunk(s) = {len(all_chunks)} total")
+        return all_chunks
 
     elif method == "Fixed-size":
         st.write(f"Using Fixed-size chunking strategy (chunk_size={chunk_size}, overlap={chunk_overlap})")
@@ -592,9 +829,10 @@ def split_documents(documents: List[Any], chunk_size: int = 800, chunk_overlap: 
             length_function=length_fn,
             separators=[""]
         )
-        split_docs = splitter.split_documents(documents)
-        st.write(f"Split into {len(split_docs)} chunks using Fixed-size method")
-        return split_docs
+        split_prose = splitter.split_documents(prose_docs)
+        all_chunks = split_prose + table_docs
+        st.write(f"Split into {len(split_prose)} prose chunks + {len(table_docs)} table chunk(s) = {len(all_chunks)} total")
+        return all_chunks
 
     else:
         st.warning(f"Unknown chunking method '{method}', defaulting to Recursive")
@@ -722,8 +960,8 @@ INSTRUCTIONS:
 2. If partial, state "Partial information available:".
 3. If no info, state "Insufficient information."
 4. Distinguish Mandatory (must/shall) vs Optional.
-5. Professional, short paragraphs.Cite specific details & pages.
-6. Output: Plain text response.
+5. Professional, short paragraphs. Do NOT include page numbers, section numbers, clause numbers, IDs, or any citation markers inside the answer text — citations are displayed separately.
+6. Output: Plain text response only, no inline references.
 ANSWER:"""
         return self.llm.invoke([HumanMessage(content=p)]).content
 
