@@ -20,6 +20,7 @@ pdfplumber
 nltk
 rapidfuzz
 google-genai
+google-cloud-aiplatform>=1.38.0
 python-docx
 openpyxl
 tabulate
